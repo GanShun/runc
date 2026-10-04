@@ -58,7 +58,7 @@ func TestAgainstLibseccomp(t *testing.T) {
 					// else the two agree, including 0xffffffff in a profile
 					// that does not mention x32. This is a deliberate gap,
 					// recorded in docs/nsenter-and-runc.md.
-					if isX32Number(nr) || (nr == ^uint32(0) && profileListsX32(config)) {
+					if profileListsX32(config) && (isX32Number(nr) || nr == ^uint32(0)) {
 						continue
 					}
 					for _, args := range argSetsToTry(config) {

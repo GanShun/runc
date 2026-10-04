@@ -42,6 +42,15 @@ func modelAction(config *configs.Seccomp, audit uint32, nr uint32, args [seccomp
 		return retKillThread, nil
 	}
 
+	// An x32 syscall on x86_64 is refused: seccomp_data.arch cannot tell it
+	// from an x86-64 syscall and there is no x32 table here. libseccomp kills
+	// them when a profile does not list SCMP_ARCH_X32 and filters them through
+	// its x32 table when it does.
+	if audit == unix.AUDIT_ARCH_X86_64 && arch == "SCMP_ARCH_X86_64" &&
+		nr&x32SyscallBit != 0 && nr != ^uint32(0) {
+		return retKillThread, nil
+	}
+
 	// The -ENOSYS stub, when the profile is restrictive: a syscall number past
 	// everything the profile mentions is answered with ENOSYS. Stated here
 	// from the profile rather than by asking enosysStub, so that the two can
@@ -56,10 +65,10 @@ func modelAction(config *configs.Seccomp, audit uint32, nr uint32, args [seccomp
 				max = num
 			}
 		}
-		// The stub skips its check for x32 syscall numbers on x86_64: the
-		// x86_64 maximum says nothing about the (much larger) x32 numbers, so
-		// it has to. No other architecture has this problem.
-		x32Number := audit == unix.AUDIT_ARCH_X86_64 && arch == "SCMP_ARCH_X86_64" && nr&(1<<30) != 0
+		// The stub skips its check when bit 30 is set: the x86_64 maximum says
+		// nothing about the (much larger) x32 numbers, so it has to. That
+		// includes 0xffffffff, which is how the kernel spells "no syscall".
+		x32Number := audit == unix.AUDIT_ARCH_X86_64 && arch == "SCMP_ARCH_X86_64" && nr&x32SyscallBit != 0
 		if max != 0 && !x32Number && nr > max {
 			return retErrnoEnosys, nil
 		}
@@ -646,7 +655,7 @@ func TestSectionIsATree(t *testing.T) {
 	}
 	rules := len(config.Syscalls)
 
-	section, err := compileArchSection(config, table, retErrnoEnosys)
+	section, err := compileArchSection(config, table, retErrnoEnosys, auditArch[archs0(short)])
 	if err != nil {
 		t.Fatalf("compileArchSection: %v", err)
 	}

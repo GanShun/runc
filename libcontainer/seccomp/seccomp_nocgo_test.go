@@ -12,6 +12,7 @@ import (
 	"golang.org/x/sys/unix"
 
 	"github.com/opencontainers/runc/libcontainer/configs"
+	"github.com/opencontainers/runtime-spec/specs-go"
 )
 
 // helperEnv makes the test binary re-exec itself as the process that installs
@@ -51,6 +52,21 @@ func TestInitSeccompLoads(t *testing.T) {
 			// matches, getpriority(1, _) falls through to the default.
 			scenario: "arg",
 			want:     []string{"fd: -1", "getppid: 0", "getpriority-arg0: 13", "getpriority-arg1: 0", "getpid: 0"},
+		},
+		{
+			// A flag means the filter goes in through seccomp(2) rather than
+			// prctl(2). It still has to work, and no listener was asked for,
+			// so no descriptor comes back.
+			scenario: "flags",
+			want:     []string{"fd: -1", "getppid: 13", "listener: no"},
+		},
+		{
+			// SCMP_ACT_NOTIFY needs SECCOMP_FILTER_FLAG_NEW_LISTENER, and the
+			// kernel answers with a file descriptor instead of 0. The notified
+			// syscall is never made: with no agent reading the descriptor it
+			// would block forever.
+			scenario: "notify",
+			want:     []string{"listener: yes", "getppid: 0"},
 		},
 		{
 			// A restrictive default means the -ENOSYS stub is prepended.
@@ -119,6 +135,21 @@ func reportAndExit(scenario string) {
 		for _, name := range allow {
 			config.Syscalls = append(config.Syscalls, &configs.Syscall{Name: name, Action: configs.Allow})
 		}
+	case "flags":
+		config = &configs.Seccomp{
+			DefaultAction: configs.Allow,
+			Flags:         []specs.LinuxSeccompFlag{specs.LinuxSeccompFlagLog},
+			Syscalls: []*configs.Syscall{
+				{Name: "getppid", Action: configs.Errno, ErrnoRet: &deny},
+			},
+		}
+	case "notify":
+		config = &configs.Seccomp{
+			DefaultAction: configs.Allow,
+			Syscalls: []*configs.Syscall{
+				{Name: "acct", Action: configs.Notify},
+			},
+		}
 	default:
 		fmt.Printf("install-failed: unknown scenario %q\n", scenario)
 		os.Exit(2)
@@ -136,6 +167,13 @@ func reportAndExit(scenario string) {
 		os.Exit(2)
 	}
 	fmt.Printf("fd: %d\n", fd)
+	// A filter that notifies has to come back with a descriptor; anything else
+	// leaves a container that needs a seccomp agent unable to start.
+	if fd >= 0 {
+		fmt.Printf("listener: yes\n")
+	} else {
+		fmt.Printf("listener: no\n")
+	}
 
 	_, _, errno := unix.RawSyscall(unix.SYS_GETPPID, 0, 0, 0)
 	fmt.Printf("getppid: %d\n", errno)

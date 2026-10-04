@@ -35,6 +35,12 @@ import (
 // chain is used first because every jump in it is short, which keeps the
 // encoder simple, whereas a tree needs long jumps through 32-bit unconditonals.
 
+// x32SyscallBit marks an x32 syscall. x32 is an ILP32 ABI on x86-64, signalled
+// per syscall rather than per process: seccomp_data.arch is AUDIT_ARCH_X86_64
+// for both ABIs, so bit 30 of the syscall number is the only way to tell them
+// apart.
+const x32SyscallBit = 1 << 30
+
 // Offsets into struct seccomp_data (linux/seccomp.h).
 const (
 	seccompDataNr       = 0
@@ -221,7 +227,7 @@ func compileFilter(config *configs.Seccomp) ([]bpf.Instruction, error) {
 			logrus.Warnf("seccomp: no syscall table for architecture %q, refusing it rather than filtering it", name)
 			continue
 		}
-		prog, err := compileArchSection(config, table, defaultRet)
+		prog, err := compileArchSection(config, table, defaultRet, audit)
 		if err != nil {
 			return nil, err
 		}
@@ -631,7 +637,7 @@ func validateArgs(call *configs.Syscall) error {
 
 // compileArchSection compiles the rules for one architecture, ending in the
 // default action.
-func compileArchSection(config *configs.Seccomp, table map[string]uint32, defaultRet uint32) ([]bpf.Instruction, error) {
+func compileArchSection(config *configs.Seccomp, table map[string]uint32, defaultRet uint32, auditArch uint32) ([]bpf.Instruction, error) {
 	// Grouped by syscall number so the tree can be ordered; the rules within a
 	// group keep profile order.
 	index := make(map[uint32]int)
@@ -684,8 +690,28 @@ func compileArchSection(config *configs.Seccomp, table map[string]uint32, defaul
 
 	const defaultLabel = "default"
 	b := &builder{}
+	t := &treeEmitter{b: b}
 	b.emit(bpf.LoadAbsolute{Off: seccompDataNr, Size: 4})
-	(&treeEmitter{b: b}).emit(groups, defaultLabel)
+
+	// On x86_64 only, an x32 syscall has to be recognised by bit 30 of the
+	// number, because seccomp_data.arch does not distinguish the two ABIs.
+	// There is no x32 syscall table here, so x32 numbers are refused rather
+	// than judged with the x86-64 table. libseccomp does the same when a
+	// profile does not list SCMP_ARCH_X32; when one does, it filters them
+	// through its x32 table, which this build cannot do, so it refuses those
+	// too. 0xffffffff is not a syscall and takes the ordinary path, as it does
+	// in libseccomp.
+	if auditArch == unix.AUDIT_ARCH_X86_64 {
+		kill, tree := t.newLabel("x32kill"), t.newLabel("tree")
+		b.jumpIf(bpf.JumpLessThan, x32SyscallBit, tree)
+		b.jumpIf(bpf.JumpNotEqual, ^uint32(0), kill)
+		b.jumpTo(tree)
+		b.label(kill)
+		b.emit(bpf.RetConstant{Val: retKillThread})
+		b.label(tree)
+	}
+
+	t.emit(groups, defaultLabel)
 	b.label(defaultLabel)
 	b.emit(bpf.RetConstant{Val: defaultRet})
 	return b.assemble()
