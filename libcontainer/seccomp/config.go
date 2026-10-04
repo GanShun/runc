@@ -136,3 +136,13 @@ func SupportedFlags() []string {
 
 	return res
 }
+
+// unknownFlagError is returned for a flag runc does not know about. It is
+// shared by the libseccomp and the cgo-free builds.
+type unknownFlagError struct {
+	flag specs.LinuxSeccompFlag
+}
+
+func (e *unknownFlagError) Error() string {
+	return "seccomp flag " + string(e.flag) + " is not known to runc"
+}

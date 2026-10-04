@@ -1,0 +1,383 @@
+//go:build linux
+
+package seccomp
+
+import (
+	"encoding/binary"
+	"errors"
+	"fmt"
+	"runtime"
+
+	"github.com/sirupsen/logrus"
+	"golang.org/x/net/bpf"
+	"golang.org/x/sys/unix"
+
+	"github.com/opencontainers/runc/libcontainer/configs"
+)
+
+// This file builds a seccomp filter for the cgo-free build, where libseccomp
+// is not available. libseccomp both compiles a profile into classic BPF and
+// loads it; only the loading half exists in Go (see patchbpf), so this
+// reimplements the compilation half.
+//
+// The filter it builds is a linear chain of one block per syscall:
+//
+//	ld  [0]            ; seccomp_data.nr
+//	jne N -> skip body ; this is not the syscall we are looking at
+//	<body>             ; argument tests, then ret <action>
+//	...
+//	ret <default>
+//
+// A linear chain is correct but runs in O(number of rules) per syscall, where
+// libseccomp builds a binary search tree and runs in O(log n). The default
+// profile has several hundred rules, so this is the main thing to improve; the
+// chain is used first because every jump in it is short, which keeps the
+// encoder simple, whereas a tree needs long jumps through 32-bit unconditonals.
+
+// Offsets into struct seccomp_data (linux/seccomp.h).
+const (
+	seccompDataNr       = 0
+	seccompDataArch     = 4
+	seccompDataArgs     = 16
+	seccompDataArgSize  = 8
+	seccompDataArgCount = 6
+)
+
+// isBigEndian reports the host byte order. The kernel runs a seccomp filter
+// over struct seccomp_data in host byte order -- verified against the running
+// kernel, where a plain comparison against a syscall number matches -- so the
+// two halves of a 64-bit argument swap places on a big-endian machine.
+var isBigEndian = func() bool {
+	var buf [2]byte
+	binary.NativeEndian.PutUint16(buf[:], 0x0102)
+	return buf[0] == 0x01
+}()
+
+// argLowOffset is the offset of the low 32 bits of an argument within its
+// 8-byte slot, and argHighOffset the offset of the high 32 bits. seccomp
+// compares only the low 32 bits, cBPF being unable to express the upper half.
+func argLowOffset() uint32 {
+	if isBigEndian {
+		return 4
+	}
+	return 0
+}
+
+func argHighOffset() uint32 { return 4 - argLowOffset() }
+
+// SECCOMP_RET_* actions (linux/seccomp.h). The low 16 bits carry the data
+// (the errno for SECCOMP_RET_ERRNO, the ptrace event for SECCOMP_RET_TRACE).
+const (
+	retKillProcess = 0x80000000
+	retKillThread  = 0x00000000
+	retTrap        = 0x00030000
+	retErrno       = 0x00050000
+	retUserNotif   = 0x7fc00000
+	retTrace       = 0x7ff00000
+	retLog         = 0x7ffc0000
+	retAllow       = 0x7fff0000
+	retDataMask    = 0x0000ffff
+)
+
+// auditArch maps a seccomp architecture name (SCMP_ARCH_*) to the
+// AUDIT_ARCH_* value that appears in seccomp_data.arch.
+var auditArch = map[string]uint32{
+	"SCMP_ARCH_X86":         unix.AUDIT_ARCH_I386,
+	"SCMP_ARCH_X86_64":      unix.AUDIT_ARCH_X86_64,
+	"SCMP_ARCH_X32":         unix.AUDIT_ARCH_X86_64, // x32 shares the x86_64 arch value
+	"SCMP_ARCH_ARM":         unix.AUDIT_ARCH_ARM,
+	"SCMP_ARCH_AARCH64":     unix.AUDIT_ARCH_AARCH64,
+	"SCMP_ARCH_MIPS":        unix.AUDIT_ARCH_MIPS,
+	"SCMP_ARCH_MIPS64":      unix.AUDIT_ARCH_MIPS64,
+	"SCMP_ARCH_MIPS64N32":   unix.AUDIT_ARCH_MIPS64N32,
+	"SCMP_ARCH_MIPSEL":      unix.AUDIT_ARCH_MIPSEL,
+	"SCMP_ARCH_MIPSEL64":    unix.AUDIT_ARCH_MIPSEL64,
+	"SCMP_ARCH_MIPSEL64N32": unix.AUDIT_ARCH_MIPSEL64N32,
+	"SCMP_ARCH_PPC":         unix.AUDIT_ARCH_PPC,
+	"SCMP_ARCH_PPC64":       unix.AUDIT_ARCH_PPC64,
+	"SCMP_ARCH_PPC64LE":     unix.AUDIT_ARCH_PPC64LE,
+	"SCMP_ARCH_RISCV64":     unix.AUDIT_ARCH_RISCV64,
+	"SCMP_ARCH_S390":        unix.AUDIT_ARCH_S390,
+	"SCMP_ARCH_S390X":       unix.AUDIT_ARCH_S390X,
+	"SCMP_ARCH_LOONGARCH64": unix.AUDIT_ARCH_LOONGARCH64,
+}
+
+// seccompRetAction converts a libcontainer action into the SECCOMP_RET_* value
+// to return.
+func seccompRetAction(action configs.Action, errnoRet *uint) (uint32, error) {
+	var ret uint32
+	switch action {
+	case configs.Kill, configs.KillThread:
+		return retKillThread, nil
+	case configs.KillProcess:
+		return retKillProcess, nil
+	case configs.Trap:
+		return retTrap, nil
+	case configs.Errno:
+		ret = retErrno
+	case configs.Trace:
+		ret = retTrace
+	case configs.Log:
+		return retLog, nil
+	case configs.Notify:
+		return retUserNotif, nil
+	case configs.Allow:
+		return retAllow, nil
+	default:
+		return 0, fmt.Errorf("invalid action %d, cannot use in rule", action)
+	}
+
+	// Errno and Trace carry a value; both default to EPERM, matching
+	// libseccomp's behaviour in the cgo build.
+	errno := uint32(unix.EPERM)
+	if errnoRet != nil {
+		errno = uint32(*errnoRet)
+	}
+	return ret | (errno & retDataMask), nil
+}
+
+// nativeSeccompArch returns the seccomp architecture name for the architecture
+// runc was built for.
+func nativeSeccompArch() (string, error) {
+	arch, ok := goarchToSeccompArch[runtime.GOARCH]
+	if !ok {
+		return "", fmt.Errorf("no seccomp syscall table for GOARCH %q", runtime.GOARCH)
+	}
+	return arch, nil
+}
+
+// archSection is one architecture's worth of compiled rules.
+type archSection struct {
+	auditArch uint32
+	prog      []bpf.Instruction
+}
+
+// compileFilter compiles a seccomp profile into a classic BPF program.
+func compileFilter(config *configs.Seccomp) ([]bpf.Instruction, error) {
+	if config == nil {
+		return nil, errors.New("nil seccomp config")
+	}
+
+	defaultRet, err := seccompRetAction(config.DefaultAction, config.DefaultErrnoRet)
+	if err != nil {
+		return nil, fmt.Errorf("invalid default action: %w", err)
+	}
+	if config.DefaultAction == configs.Notify {
+		// Matches the cgo build: runc has to write the seccomp fd to its
+		// parent after installing the filter, and a notifying write would
+		// never get there.
+		return nil, errors.New("SCMP_ACT_NOTIFY cannot be used as default action")
+	}
+
+	// The native architecture is always present; config.Architectures adds
+	// any others a profile wants to allow (a 32-bit process on a 64-bit
+	// kernel, typically).
+	native, err := nativeSeccompArch()
+	if err != nil {
+		return nil, err
+	}
+	arches := append([]string{native}, config.Architectures...)
+
+	sections := make([]archSection, 0, len(arches))
+	seen := make(map[uint32]bool, len(arches))
+
+	for _, arch := range arches {
+		audit, ok := auditArch[arch]
+		if !ok {
+			return nil, fmt.Errorf("unknown seccomp architecture %q", arch)
+		}
+		// Two seccomp architectures can share one AUDIT_ARCH value (x32 and
+		// x86_64); the first match wins, as in libseccomp.
+		if seen[audit] {
+			continue
+		}
+		seen[audit] = true
+
+		table, ok := syscallNumbers[arch]
+		if !ok {
+			return nil, fmt.Errorf("no syscall table for architecture %q", arch)
+		}
+		prog, err := compileArchSection(config, table, defaultRet)
+		if err != nil {
+			return nil, err
+		}
+		sections = append(sections, archSection{auditArch: audit, prog: prog})
+	}
+
+	return assembleFilter(sections, defaultRet), nil
+}
+
+// assembleFilter lays out the architecture dispatch followed by each
+// architecture's section.
+//
+//	ld  [4]
+//	jeq A0 -> 0,1 ; jmp section0
+//	jeq A1 -> 0,1 ; jmp section1
+//	...
+//	ret KILL_PROCESS   ; the arch matched nothing
+//	section0:
+//	  ...
+//	section1:
+//	  ...
+func assembleFilter(sections []archSection, defaultRet uint32) []bpf.Instruction {
+	// The jmp targets are 32-bit, so the architecture tests can reach a
+	// section of any size; only the jeq's own skip has to stay small, and it
+	// is always 1.
+	header := 1 + 2*len(sections) + 1
+	starts := make([]int, len(sections))
+	offset := header
+	for i, s := range sections {
+		starts[i] = offset
+		offset += len(s.prog)
+	}
+
+	prog := make([]bpf.Instruction, 0, offset)
+	prog = append(prog, bpf.LoadAbsolute{Off: seccompDataArch, Size: 4})
+	for i, s := range sections {
+		prog = append(prog, bpf.JumpIf{
+			Cond:      bpf.JumpEqual,
+			Val:       s.auditArch,
+			SkipTrue:  0,
+			SkipFalse: 1,
+		})
+		// This instruction is at index 2*i+2, so it is followed by index
+		// 2*i+3; skip from there to the section.
+		prog = append(prog, bpf.Jump{Skip: uint32(starts[i] - (2*i + 3))})
+	}
+	// Reached only when the architecture is none of the above: refusing to
+	// run is the safe answer, and matches libseccomp.
+	prog = append(prog, bpf.RetConstant{Val: retKillProcess})
+	for _, s := range sections {
+		prog = append(prog, s.prog...)
+	}
+	return prog
+}
+
+// compileArchSection compiles the rules for one architecture, ending in the
+// default action.
+func compileArchSection(config *configs.Seccomp, table map[string]uint32, defaultRet uint32) ([]bpf.Instruction, error) {
+	prog := []bpf.Instruction{}
+	for _, call := range config.Syscalls {
+		if call == nil {
+			return nil, errors.New("encountered nil syscall while initializing seccomp")
+		}
+		if len(call.Name) == 0 {
+			return nil, errors.New("empty string is not a valid syscall")
+		}
+		if call.Action == configs.Notify && call.Name == "write" {
+			return nil, errors.New("SCMP_ACT_NOTIFY cannot be used for the write syscall")
+		}
+
+		body, err := compileRule(call, defaultRet)
+		if err != nil {
+			return nil, err
+		}
+		if len(body) == 0 {
+			// Redundant rule (same action as the default, no conditions).
+			continue
+		}
+		if len(body) > 0xff {
+			return nil, fmt.Errorf("seccomp rule for %s is too long (%d instructions)", call.Name, len(body))
+		}
+
+		num, ok := table[call.Name]
+		if !ok {
+			// Not every name in a profile exists on every architecture, and
+			// libseccomp resolves names against its own tables. Skipping is
+			// what the cgo build does too.
+			logrus.Debugf("unknown seccomp syscall %q on this architecture, ignored", call.Name)
+			continue
+		}
+
+		prog = append(prog,
+			bpf.LoadAbsolute{Off: seccompDataNr, Size: 4},
+			bpf.JumpIf{
+				Cond:      bpf.JumpNotEqual,
+				Val:       num,
+				SkipTrue:  uint8(len(body)),
+				SkipFalse: 0,
+			},
+		)
+		prog = append(prog, body...)
+	}
+	return append(prog, bpf.RetConstant{Val: defaultRet}), nil
+}
+
+// compileRule builds the body for one syscall: the argument tests (all of
+// which must hold) followed by the action. It returns nothing when the rule
+// is redundant, so that the caller can drop it.
+func compileRule(call *configs.Syscall, defaultRet uint32) ([]bpf.Instruction, error) {
+	action, err := seccompRetAction(call.Action, call.ErrnoRet)
+	if err != nil {
+		return nil, fmt.Errorf("action in seccomp profile is invalid: %w", err)
+	}
+	if action == defaultRet && len(call.Args) == 0 {
+		// Same result as the default action, so the rule can never change the
+		// outcome. This compares the whole action rather than just its kind:
+		// two SCMP_ACT_ERRNO rules returning different errnos are not the
+		// same rule.
+		return nil, nil
+	}
+	if len(call.Args) == 0 {
+		return []bpf.Instruction{bpf.RetConstant{Val: action}}, nil
+	}
+
+	body := []bpf.Instruction{}
+	// failAt records the conditional jumps that abandon the rule, so their
+	// skips can be filled in once the body length is known.
+	var failAt []int
+
+	for _, arg := range call.Args {
+		if arg == nil {
+			return nil, fmt.Errorf("nil argument in seccomp rule for %s", call.Name)
+		}
+		if arg.Index >= seccompDataArgCount {
+			return nil, fmt.Errorf("seccomp rule for %s: argument index %d out of range", call.Name, arg.Index)
+		}
+
+		// seccomp only compares the low 32 bits of an argument, as does
+		// libseccomp; the high half is simply not expressible in cBPF.
+		body = append(body, bpf.LoadAbsolute{
+			Off:  uint32(seccompDataArgs+seccompDataArgSize*arg.Index) + argLowOffset(),
+			Size: 4,
+		})
+
+		// The condition below is the one that makes the rule *not* match;
+		// the rule is skipped when it is true. The comparison operators are
+		// expressed as A <op> K, which is what the cBPF jumps implement.
+		var fail bpf.JumpTest
+		switch arg.Op {
+		case configs.EqualTo:
+			fail = bpf.JumpNotEqual
+		case configs.NotEqualTo:
+			fail = bpf.JumpEqual
+		case configs.GreaterThan:
+			fail = bpf.JumpLessOrEqual
+		case configs.GreaterThanOrEqualTo:
+			fail = bpf.JumpLessThan
+		case configs.LessThan:
+			fail = bpf.JumpGreaterOrEqual
+		case configs.LessThanOrEqualTo:
+			fail = bpf.JumpGreaterThan
+		case configs.MaskEqualTo:
+			// (arg & mask) == value, so mask first and then compare.
+			body = append(body, bpf.ALUOpConstant{Op: bpf.ALUOpAnd, Val: uint32(arg.ValueTwo)})
+			fail = bpf.JumpNotEqual
+		default:
+			return nil, fmt.Errorf("invalid operator %d in seccomp rule for %s", arg.Op, call.Name)
+		}
+
+		failAt = append(failAt, len(body))
+		body = append(body, bpf.JumpIf{Cond: fail, Val: uint32(arg.Value)})
+	}
+
+	body = append(body, bpf.RetConstant{Val: action})
+	// Every failing test jumps past the action, i.e. to the end of the body.
+	for _, i := range failAt {
+		j := body[i].(bpf.JumpIf)
+		j.SkipTrue = uint8(len(body) - i - 1)
+		j.SkipFalse = 0
+		body[i] = j
+	}
+	return body, nil
+}
