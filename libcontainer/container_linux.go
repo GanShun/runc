@@ -562,6 +562,7 @@ func (c *Container) newParentProcess(p *Process) (parentProcess, error) {
 	if cmd.SysProcAttr == nil {
 		cmd.SysProcAttr = &unix.SysProcAttr{}
 	}
+	setCloneFlags(cmd, c.config.Namespaces.CloneFlags())
 	cmd.Env = append(cmd.Env, "GOMAXPROCS="+os.Getenv("GOMAXPROCS"))
 	cmd.ExtraFiles = append(cmd.ExtraFiles, p.ExtraFiles...)
 	if p.ConsoleSocket != nil {
