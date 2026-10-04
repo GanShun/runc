@@ -844,13 +844,19 @@ func (p *initProcess) start() (retErr error) {
 			return fmt.Errorf("unable to apply Intel RDT configuration: %w", err)
 		}
 	}
-	if _, err := io.Copy(p.comm.initSockParent, p.bootstrapData); err != nil {
-		return fmt.Errorf("can't copy bootstrap data to pipe: %w", err)
-	}
-
-	childPid, err := p.getChildPid()
-	if err != nil {
-		return fmt.Errorf("can't get final child's PID from pipe: %w", err)
+	var childPid int
+	if puregoNamespaces {
+		// No C stage: the direct child is the container init (a single
+		// clone created the namespaces), so its PID is the one we want.
+		childPid = p.cmd.Process.Pid
+	} else {
+		if _, err := io.Copy(p.comm.initSockParent, p.bootstrapData); err != nil {
+			return fmt.Errorf("can't copy bootstrap data to pipe: %w", err)
+		}
+		childPid, err = p.getChildPid()
+		if err != nil {
+			return fmt.Errorf("can't get final child's PID from pipe: %w", err)
+		}
 	}
 
 	// Save the standard descriptor names before the container process
@@ -862,9 +868,11 @@ func (p *initProcess) start() (retErr error) {
 	}
 	p.setExternalDescriptors(fds)
 
-	// Wait for our first child to exit
-	if err := p.waitForChildExit(childPid); err != nil {
-		return fmt.Errorf("error waiting for our first child to exit: %w", err)
+	if !puregoNamespaces {
+		// Wait for our first child to exit
+		if err := p.waitForChildExit(childPid); err != nil {
+			return fmt.Errorf("error waiting for our first child to exit: %w", err)
+		}
 	}
 
 	// Spin up a goroutine to handle remapping mount requests by runc init.
