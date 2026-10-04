@@ -4,6 +4,7 @@ package seccomp
 
 import (
 	"encoding/binary"
+	"math"
 	"runtime"
 	"testing"
 
@@ -584,6 +585,70 @@ func validateProgram(t *testing.T, prog []bpf.Instruction) {
 			}
 			stack = append(stack, n)
 		}
+	}
+}
+
+// longestPath returns the number of instructions on the longest path from the
+// first instruction to a return. Every jump in a compiled section is forward, so
+// the paths form a DAG and one reverse pass suffices.
+func longestPath(prog []bpf.Instruction) int {
+	best := make([]int, len(prog))
+	for i := len(prog) - 1; i >= 0; i-- {
+		var succ []int
+		switch v := prog[i].(type) {
+		case bpf.RetConstant, bpf.RetA:
+			best[i] = 1
+			continue
+		case bpf.Jump:
+			succ = []int{i + 1 + int(v.Skip)}
+		case bpf.JumpIf:
+			succ = []int{i + 1 + int(v.SkipTrue), i + 1 + int(v.SkipFalse)}
+		default:
+			succ = []int{i + 1}
+		}
+		longest := 0
+		for _, s := range succ {
+			if s < len(prog) && best[s] > longest {
+				longest = best[s]
+			}
+		}
+		best[i] = 1 + longest
+	}
+	return best[0]
+}
+
+// TestSectionIsATree checks that the rules are laid out as a search tree rather
+// than walked one by one: the number of instructions a syscall passes through has
+// to grow with log(rules), not with rules. A chain is still correct, so nothing
+// else here would notice if the tree were lost.
+func TestSectionIsATree(t *testing.T) {
+	short, err := shortNativeArch()
+	if err != nil {
+		t.Fatal(err)
+	}
+	table := syscallNumbers[archs0(short)]
+	config := &configs.Seccomp{DefaultAction: configs.Errno}
+	for name := range table {
+		config.Syscalls = append(config.Syscalls, &configs.Syscall{Name: name, Action: configs.Allow})
+	}
+	rules := len(config.Syscalls)
+
+	section, err := compileArchSection(config, table, retErrnoEnosys)
+	if err != nil {
+		t.Fatalf("compileArchSection: %v", err)
+	}
+	validateProgram(t, section)
+
+	depth := longestPath(section)
+	budget := 6*int(math.Ceil(math.Log2(float64(rules)))) + 24
+	t.Logf("%d rules: %d instructions, longest path %d (budget %d)", rules, len(section), depth, budget)
+
+	if depth > budget {
+		t.Errorf("longest path is %d instructions, over the %d a tree should need: the rules look like a chain", depth, budget)
+	}
+	// A chain would be about three instructions per rule.
+	if len(section) > 4*rules {
+		t.Errorf("%d instructions for %d rules, larger than a search tree should need", len(section), rules)
 	}
 }
 

@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"runtime"
+	"sort"
 
 	"github.com/sirupsen/logrus"
 	"golang.org/x/net/bpf"
@@ -287,10 +288,216 @@ func assembleFilter(sections []archSection, defaultRet uint32) []bpf.Instruction
 	return prog
 }
 
+// A classic BPF conditional jump only reaches 255 instructions ahead, and a
+// profile for a restrictive default has several hundred rules, so the jumps a
+// binary search tree needs cannot be worked out by hand. These are the pieces of
+// a small assembler with labels: a conditional jump that cannot reach its target
+// in one instruction becomes a conditional that falls through onto a 32-bit
+// unconditional jump, which reaches anywhere. cBPF cannot jump backwards, so
+// every target has to be ahead of its jump.
+
+type opKind int
+
+const (
+	opInsn opKind = iota
+	opJump
+	opCondJump
+	opLabel
+)
+
+type op struct {
+	kind   opKind
+	insn   bpf.Instruction
+	cond   bpf.JumpTest
+	val    uint32
+	target string
+	label  string
+}
+
+type builder struct {
+	ops []op
+}
+
+func (b *builder) emit(insns ...bpf.Instruction) {
+	for _, ins := range insns {
+		b.ops = append(b.ops, op{kind: opInsn, insn: ins})
+	}
+}
+
+func (b *builder) label(name string) {
+	b.ops = append(b.ops, op{kind: opLabel, label: name})
+}
+
+// jumpTo jumps to target unconditionally.
+func (b *builder) jumpTo(target string) {
+	b.ops = append(b.ops, op{kind: opJump, target: target})
+}
+
+// jumpIf jumps to target when the condition holds comparing val against A, and
+// otherwise continues with the instruction after it.
+func (b *builder) jumpIf(cond bpf.JumpTest, val uint32, target string) {
+	b.ops = append(b.ops, op{kind: opCondJump, cond: cond, val: val, target: target})
+}
+
+// layout gives every op its instruction offset and every label its target.
+func (b *builder) layout(size []int) ([]int, map[string]int, error) {
+	off := make([]int, len(b.ops))
+	labels := make(map[string]int)
+	at := 0
+	for i, o := range b.ops {
+		off[i] = at
+		if o.kind == opLabel {
+			if _, dup := labels[o.label]; dup {
+				return nil, nil, fmt.Errorf("seccomp: duplicate label %q", o.label)
+			}
+			labels[o.label] = at
+		}
+		at += size[i]
+	}
+	return off, labels, nil
+}
+
+// assemble lays the program out and resolves the labels. Instruction sizes only
+// ever grow, so iterating until nothing changes terminates.
+func (b *builder) assemble() ([]bpf.Instruction, error) {
+	size := make([]int, len(b.ops))
+	for i, o := range b.ops {
+		if o.kind == opLabel {
+			size[i] = 0
+		} else {
+			size[i] = 1
+		}
+	}
+
+	for pass := 0; pass <= len(b.ops); pass++ {
+		off, labels, err := b.layout(size)
+		if err != nil {
+			return nil, err
+		}
+
+		changed := false
+		for i, o := range b.ops {
+			if o.kind != opCondJump {
+				continue
+			}
+			target, ok := labels[o.target]
+			if !ok {
+				return nil, fmt.Errorf("seccomp: jump to unknown label %q", o.target)
+			}
+			want := 1
+			if dist := target - (off[i] + 1); dist < 0 || dist > 255 {
+				want = 2
+			}
+			if size[i] != want {
+				size[i] = want
+				changed = true
+			}
+		}
+		if changed {
+			continue
+		}
+
+		out := make([]bpf.Instruction, 0, len(b.ops))
+		for i, o := range b.ops {
+			switch o.kind {
+			case opLabel:
+				// Emits nothing; it only names a position.
+			case opInsn:
+				out = append(out, o.insn)
+			case opJump:
+				dist := labels[o.target] - (off[i] + 1)
+				if dist < 0 {
+					return nil, fmt.Errorf("seccomp: jump to %q goes backwards, which cBPF cannot express", o.target)
+				}
+				out = append(out, bpf.Jump{Skip: uint32(dist)})
+			case opCondJump:
+				dist := labels[o.target] - (off[i] + 1)
+				if dist < 0 {
+					return nil, fmt.Errorf("seccomp: jump to %q goes backwards, which cBPF cannot express", o.target)
+				}
+				if size[i] == 1 {
+					out = append(out, bpf.JumpIf{Cond: o.cond, Val: o.val, SkipTrue: uint8(dist), SkipFalse: 0})
+					continue
+				}
+				// On the condition, fall through onto the jump; otherwise
+				// skip it and carry on.
+				out = append(out,
+					bpf.JumpIf{Cond: o.cond, Val: o.val, SkipTrue: 0, SkipFalse: 1},
+					bpf.Jump{Skip: uint32(labels[o.target] - (off[i] + 2))},
+				)
+			}
+		}
+		return out, nil
+	}
+	return nil, errors.New("seccomp: jump layout did not settle")
+}
+
+// ruleGroup is every rule a profile gives for one syscall, in profile order: the
+// first whose argument conditions hold decides.
+type ruleGroup struct {
+	num    uint32
+	bodies [][]bpf.Instruction
+}
+
+// treeEmitter lays rules out as a balanced binary search over the syscall
+// number, so a syscall costs O(log rules) comparisons instead of walking all of
+// them. The descent lands on the nearest key rather than necessarily an equal
+// one, so each group still checks for equality.
+type treeEmitter struct {
+	b    *builder
+	next int
+}
+
+func (t *treeEmitter) emit(groups []ruleGroup, defaultLabel string) {
+	if len(groups) == 0 {
+		t.b.jumpTo(defaultLabel)
+		return
+	}
+	if len(groups) == 1 {
+		t.emitGroup(groups[0], defaultLabel)
+		return
+	}
+
+	mid := len(groups) / 2
+	right := fmt.Sprintf("right%d", t.next)
+	t.next++
+
+	// A holds the syscall number here and nothing has clobbered it: a leaf body
+	// is only reached once the descent is over, and it never returns to the
+	// tree.
+	//
+	// JumpGreaterOrEqual compares A against the value, i.e. "nr >= pivot", which
+	// is the direction the kernel implements. x/net/bpf's doc comments describe
+	// these the other way round; the arg operator code above follows the
+	// encoding too, which is why it is right.
+	t.b.jumpIf(bpf.JumpGreaterOrEqual, groups[mid].num, right)
+	t.emit(groups[:mid], defaultLabel)
+	t.b.label(right)
+	t.emit(groups[mid:], defaultLabel)
+}
+
+func (t *treeEmitter) emitGroup(g ruleGroup, defaultLabel string) {
+	t.b.jumpIf(bpf.JumpNotEqual, g.num, defaultLabel)
+	for _, body := range g.bodies {
+		t.b.emit(body...)
+	}
+	// A body with argument conditions falls through to here when they do not
+	// hold, so the default action has to be reached from here. A bare action
+	// always returns, so the jump would be unreachable code -- and there is one
+	// of these per rule in the common case where no rule has conditions.
+	if last := g.bodies[len(g.bodies)-1]; len(last) > 1 {
+		t.b.jumpTo(defaultLabel)
+	}
+}
+
 // compileArchSection compiles the rules for one architecture, ending in the
 // default action.
 func compileArchSection(config *configs.Seccomp, table map[string]uint32, defaultRet uint32) ([]bpf.Instruction, error) {
-	prog := []bpf.Instruction{}
+	// Grouped by syscall number so the tree can be ordered; the bodies within a
+	// group keep profile order.
+	index := make(map[uint32]int)
+	var groups []ruleGroup
+
 	for _, call := range config.Syscalls {
 		if call == nil {
 			return nil, errors.New("encountered nil syscall while initializing seccomp")
@@ -311,6 +518,8 @@ func compileArchSection(config *configs.Seccomp, table map[string]uint32, defaul
 			continue
 		}
 		if len(body) > 0xff {
+			// The failing argument tests inside a body skip to its end with an
+			// 8-bit offset.
 			return nil, fmt.Errorf("seccomp rule for %s is too long (%d instructions)", call.Name, len(body))
 		}
 
@@ -323,18 +532,23 @@ func compileArchSection(config *configs.Seccomp, table map[string]uint32, defaul
 			continue
 		}
 
-		prog = append(prog,
-			bpf.LoadAbsolute{Off: seccompDataNr, Size: 4},
-			bpf.JumpIf{
-				Cond:      bpf.JumpNotEqual,
-				Val:       num,
-				SkipTrue:  uint8(len(body)),
-				SkipFalse: 0,
-			},
-		)
-		prog = append(prog, body...)
+		if at, seen := index[num]; seen {
+			groups[at].bodies = append(groups[at].bodies, body)
+			continue
+		}
+		index[num] = len(groups)
+		groups = append(groups, ruleGroup{num: num, bodies: [][]bpf.Instruction{body}})
 	}
-	return append(prog, bpf.RetConstant{Val: defaultRet}), nil
+
+	sort.Slice(groups, func(i, j int) bool { return groups[i].num < groups[j].num })
+
+	const defaultLabel = "default"
+	b := &builder{}
+	b.emit(bpf.LoadAbsolute{Off: seccompDataNr, Size: 4})
+	(&treeEmitter{b: b}).emit(groups, defaultLabel)
+	b.label(defaultLabel)
+	b.emit(bpf.RetConstant{Val: defaultRet})
+	return b.assemble()
 }
 
 // compileRule builds the body for one syscall: the argument tests (all of
