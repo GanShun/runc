@@ -381,7 +381,10 @@ func TestContainerdDefaultArchitectures(t *testing.T) {
 	}
 	config := &configs.Seccomp{
 		DefaultAction: configs.Errno,
-		Architectures: []string{"SCMP_ARCH_X86_64", "SCMP_ARCH_X86", "SCMP_ARCH_X32"},
+		// The short names, because that is what specconv puts in
+		// configs.Seccomp.Architectures: it converts OCI's SCMP_ARCH_* to
+		// these. TestExtraArchitecture covers the other spelling.
+		Architectures: []string{"amd64", "x86", "x32"},
 		Syscalls: []*configs.Syscall{
 			{Name: "read", Action: configs.Allow},
 			{Name: "close", Action: configs.Allow},

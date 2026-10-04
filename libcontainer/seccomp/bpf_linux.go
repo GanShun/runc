@@ -152,6 +152,22 @@ type archSection struct {
 	prog      []bpf.Instruction
 }
 
+// normalizeArch turns an architecture name from a profile into the SCMP_ARCH_*
+// name the tables are keyed by. Both spellings turn up: specconv converts OCI's
+// "SCMP_ARCH_X86_64" into the short "amd64" for configs.Seccomp.Architectures,
+// while the native architecture is known here by its SCMP_ARCH_* name.
+func normalizeArch(name string) (string, bool) {
+	if _, ok := auditArch[name]; ok {
+		return name, true
+	}
+	for scmp, short := range archs {
+		if short == name {
+			return scmp, true
+		}
+	}
+	return "", false
+}
+
 // compileFilter compiles a seccomp profile into a classic BPF program.
 func compileFilter(config *configs.Seccomp) ([]bpf.Instruction, error) {
 	if config == nil {
@@ -181,13 +197,14 @@ func compileFilter(config *configs.Seccomp) ([]bpf.Instruction, error) {
 	sections := make([]archSection, 0, len(arches))
 	seen := make(map[uint32]bool, len(arches))
 
-	for _, arch := range arches {
-		audit, ok := auditArch[arch]
+	for _, name := range arches {
+		arch, ok := normalizeArch(name)
 		if !ok {
-			return nil, fmt.Errorf("unknown seccomp architecture %q", arch)
+			return nil, fmt.Errorf("unknown seccomp architecture %q", name)
 		}
-		// Two seccomp architectures can share one AUDIT_ARCH value (x32 and
-		// x86_64); the first match wins, as in libseccomp.
+		audit := auditArch[arch]
+		// Two architectures can share one AUDIT_ARCH value (x32 and x86_64);
+		// the first match wins, as in libseccomp.
 		if seen[audit] {
 			continue
 		}
@@ -195,7 +212,13 @@ func compileFilter(config *configs.Seccomp) ([]bpf.Instruction, error) {
 
 		table, ok := syscallNumbers[arch]
 		if !ok {
-			return nil, fmt.Errorf("no syscall table for architecture %q", arch)
+			// x/sys/unix carries no table for this architecture (x32, the
+			// mips n32 ABIs, 31-bit s390). Leaving it out of the dispatch
+			// means the filter's bad-architecture action refuses it, which
+			// is fail-closed and better than filtering it with the wrong
+			// numbering.
+			logrus.Warnf("seccomp: no syscall table for architecture %q, refusing it rather than filtering it", name)
+			continue
 		}
 		prog, err := compileArchSection(config, table, defaultRet)
 		if err != nil {

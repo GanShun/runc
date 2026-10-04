@@ -73,11 +73,12 @@ func enosysStub(config *configs.Seccomp) ([]bpf.Instruction, error) {
 // profile mentions.
 func findLastSyscalls(config *configs.Seccomp) (lastSyscallMap, error) {
 	arches := make(map[string]struct{})
-	for _, ociArch := range config.Architectures {
-		if _, ok := auditArch[ociArch]; !ok {
-			return nil, fmt.Errorf("unknown seccomp architecture %q", ociArch)
+	for _, name := range config.Architectures {
+		arch, ok := normalizeArch(name)
+		if !ok {
+			return nil, fmt.Errorf("unknown seccomp architecture %q", name)
 		}
-		arches[ociArch] = struct{}{}
+		arches[arch] = struct{}{}
 	}
 	// Some profiles leave the native architecture out of the list, which
 	// would make the stub a no-op, so always include it.
