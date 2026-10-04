@@ -204,7 +204,18 @@ func compileFilter(config *configs.Seccomp) ([]bpf.Instruction, error) {
 		sections = append(sections, archSection{auditArch: audit, prog: prog})
 	}
 
-	return assembleFilter(sections, defaultRet), nil
+	prog := assembleFilter(sections, defaultRet)
+
+	// The stub goes in front, so that a syscall the profile knows nothing about
+	// is answered with ENOSYS rather than the default action.
+	stub, err := enosysStub(config)
+	if err != nil {
+		return nil, err
+	}
+	if len(stub) == 0 {
+		return prog, nil
+	}
+	return append(stub, prog...), nil
 }
 
 // assembleFilter lays out the architecture dispatch followed by each

@@ -42,16 +42,23 @@ func TestInitSeccompLoads(t *testing.T) {
 		want     []string
 	}{
 		{
-			// One unconditional rule: getppid gets EACCES, and the other two
-			// syscalls are untouched.
+			// A permissive default means no stub, so an unknown syscall runs.
 			scenario: "syscall",
-			want:     []string{"fd: -1", "getppid: 13", "getpriority-arg0: 0", "getpriority-arg1: 0"},
+			want:     []string{"fd: -1", "getppid: 13", "getpriority-arg0: 0", "getpriority-arg1: 0", "getpid: 0"},
 		},
 		{
 			// A rule with an argument condition: only getpriority(0, _)
 			// matches, getpriority(1, _) falls through to the default.
 			scenario: "arg",
-			want:     []string{"fd: -1", "getppid: 0", "getpriority-arg0: 13", "getpriority-arg1: 0"},
+			want:     []string{"fd: -1", "getppid: 0", "getpriority-arg0: 13", "getpriority-arg1: 0", "getpid: 0"},
+		},
+		{
+			// A restrictive default means the -ENOSYS stub is prepended.
+			// The profile allows enough for the process to run and exit,
+			// and its largest syscall is well below clone3, so clone3 must
+			// come back as ENOSYS (38) rather than the default action.
+			scenario: "enosys",
+			want:     []string{"fd: -1", "clone3: 38"},
 		},
 	}
 
@@ -98,6 +105,20 @@ func reportAndExit(scenario string) {
 				},
 			},
 		}
+	case "enosys":
+		// Enough of an allowlist for the process to print and exit, with the
+		// largest number comfortably below clone3's.
+		allow := []string{
+			"write", "close", "exit_group", "futex", "rt_sigreturn",
+			"rt_sigprocmask", "sigaltstack", "sched_yield", "nanosleep",
+			"clock_gettime", "getpid", "gettid", "mmap", "munmap", "madvise",
+			"brk", "tgkill", "epoll_pwait", "read", "openat", "fcntl",
+			"newfstatat", "lseek", "ioctl", "getrandom", "prctl",
+		}
+		config = &configs.Seccomp{DefaultAction: configs.Errno}
+		for _, name := range allow {
+			config.Syscalls = append(config.Syscalls, &configs.Syscall{Name: name, Action: configs.Allow})
+		}
 	default:
 		fmt.Printf("install-failed: unknown scenario %q\n", scenario)
 		os.Exit(2)
@@ -124,6 +145,18 @@ func reportAndExit(scenario string) {
 	fmt.Printf("getpriority-arg0: %d\n", errno)
 	_, _, errno = unix.RawSyscall(unix.SYS_GETPRIORITY, 1, 0, 0)
 	fmt.Printf("getpriority-arg1: %d\n", errno)
+	// getpid is in no profile the tests use, and its number is past the
+	// largest in the "enosys" one, so the stub should turn it into ENOSYS.
+	_, _, errno = unix.RawSyscall(unix.SYS_GETPID, 0, 0, 0)
+	fmt.Printf("getpid: %d\n", errno)
+	// clone3 is the syscall the stub really exists for: libc probes it and
+	// falls back to clone on ENOSYS, where the default action would make it
+	// fail. This profile does not mention it and its number is past every
+	// number that is mentioned, so the kernel must answer ENOSYS. A NULL
+	// arguments pointer reaches the kernel as EFAULT, so ENOSYS here is the
+	// stub's doing and not the kernel's.
+	_, _, errno = unix.RawSyscall(unix.SYS_CLONE3, 0, 0, 0)
+	fmt.Printf("clone3: %d\n", errno)
 
 	os.Exit(0)
 }

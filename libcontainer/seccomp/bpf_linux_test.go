@@ -314,3 +314,94 @@ func TestLargeProfileSize(t *testing.T) {
 		t.Errorf("the kernel's verifier would reject this program: %v", err)
 	}
 }
+
+// TestEnosysStub covers the reason the stub exists: a syscall number past
+// every number in the profile is answered with ENOSYS rather than the default
+// action, which is what lets libc fall back from clone3 to clone.
+func TestEnosysStub(t *testing.T) {
+	arch := nativeAuditArch(t)
+	max := syscallNumber(t, "openat")
+	if max < syscallNumber(t, "stat") {
+		t.Skip("this architecture numbers openat below stat")
+	}
+
+	config := &configs.Seccomp{
+		DefaultAction: configs.Errno,
+		Syscalls: []*configs.Syscall{
+			{Name: "close", Action: configs.Allow},
+			{Name: "openat", Action: configs.Allow},
+		},
+	}
+
+	// In the profile: its own action.
+	if ret := run(t, config, seccompDataImage(syscallNumber(t, "close"), arch)); ret != int(retAllow) {
+		t.Errorf("close: got %#x, want allow", ret)
+	}
+	// Below the largest number in the profile but not in the profile: the stub
+	// does not reach this, so the default action applies.
+	if ret, want := run(t, config, seccompDataImage(syscallNumber(t, "stat"), arch)), errnoAction(uint32(unix.EPERM)); ret != want {
+		t.Errorf("stat: got %#x, want %#x", ret, want)
+	}
+	// Past the end of the profile: ENOSYS, not the default action.
+	for _, nr := range []uint32{max + 1, max + 100, 4200} {
+		if ret := run(t, config, seccompDataImage(nr, arch)); ret != int(retErrnoEnosys) {
+			t.Errorf("syscall %d: got %#x, want ENOSYS %#x", nr, ret, int(retErrnoEnosys))
+		}
+	}
+}
+
+// TestNoEnosysStubForPermissiveDefault checks the stub is left out when the
+// default action is permissive, where an unknown syscall should just run.
+func TestNoEnosysStubForPermissiveDefault(t *testing.T) {
+	arch := nativeAuditArch(t)
+	config := &configs.Seccomp{
+		DefaultAction: configs.Allow,
+		Syscalls: []*configs.Syscall{
+			{Name: "openat", Action: configs.Errno},
+		},
+	}
+	if ret := run(t, config, seccompDataImage(4200, arch)); ret != int(retAllow) {
+		t.Errorf("got %#x, want allow: no stub should have been added", ret)
+	}
+	if _, err := enosysStub(config); err != nil {
+		t.Fatalf("enosysStub: %v", err)
+	} else if stub, _ := enosysStub(config); len(stub) != 0 {
+		t.Errorf("stub is %d instructions, want none", len(stub))
+	}
+}
+
+// TestContainerdDefaultArchitectures compiles the architecture list that
+// containerd's default profile carries, which is what a Kubernetes pod gets
+// from RuntimeDefault. X32 shares its AUDIT_ARCH with x86_64 and x/sys/unix
+// has no x32 table, so this is where a missing table would break every real
+// pod rather than some edge case.
+func TestContainerdDefaultArchitectures(t *testing.T) {
+	if runtime.GOARCH != "amd64" {
+		t.Skip("this is the amd64 architecture list")
+	}
+	config := &configs.Seccomp{
+		DefaultAction: configs.Errno,
+		Architectures: []string{"SCMP_ARCH_X86_64", "SCMP_ARCH_X86", "SCMP_ARCH_X32"},
+		Syscalls: []*configs.Syscall{
+			{Name: "read", Action: configs.Allow},
+			{Name: "close", Action: configs.Allow},
+		},
+	}
+	prog, err := compileFilter(config)
+	if err != nil {
+		t.Fatalf("compileFilter: %v", err)
+	}
+	if _, err := bpf.NewVM(prog); err != nil {
+		t.Fatalf("NewVM: %v", err)
+	}
+
+	// The native section still has to allow what the profile allows.
+	if ret := run(t, config, seccompDataImage(syscallNumber(t, "read"), nativeAuditArch(t))); ret != int(retAllow) {
+		t.Errorf("native read: got %#x, want allow", ret)
+	}
+	// And the 32-bit section has to use the i386 numbering.
+	i386Read := syscallNumbers["SCMP_ARCH_X86"]["read"]
+	if ret := run(t, config, seccompDataImage(i386Read, unix.AUDIT_ARCH_I386)); ret != int(retAllow) {
+		t.Errorf("i386 read: got %#x, want allow", ret)
+	}
+}
