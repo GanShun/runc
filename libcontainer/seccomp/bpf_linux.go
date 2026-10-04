@@ -379,30 +379,38 @@ func compileRule(call *configs.Syscall, defaultRet uint32) ([]bpf.Instruction, e
 		// The condition below is the one that makes the rule *not* match;
 		// the rule is skipped when it is true. The comparison operators are
 		// expressed as A <op> K, which is what the cBPF jumps implement.
-		var fail bpf.JumpTest
+		var (
+			fail   bpf.JumpTest
+			expect uint32
+		)
 		switch arg.Op {
 		case configs.EqualTo:
-			fail = bpf.JumpNotEqual
+			fail, expect = bpf.JumpNotEqual, uint32(arg.Value)
 		case configs.NotEqualTo:
-			fail = bpf.JumpEqual
+			fail, expect = bpf.JumpEqual, uint32(arg.Value)
 		case configs.GreaterThan:
-			fail = bpf.JumpLessOrEqual
+			fail, expect = bpf.JumpLessOrEqual, uint32(arg.Value)
 		case configs.GreaterThanOrEqualTo:
-			fail = bpf.JumpLessThan
+			fail, expect = bpf.JumpLessThan, uint32(arg.Value)
 		case configs.LessThan:
-			fail = bpf.JumpGreaterOrEqual
+			fail, expect = bpf.JumpGreaterOrEqual, uint32(arg.Value)
 		case configs.LessThanOrEqualTo:
-			fail = bpf.JumpGreaterThan
+			fail, expect = bpf.JumpGreaterThan, uint32(arg.Value)
 		case configs.MaskEqualTo:
-			// (arg & mask) == value, so mask first and then compare.
-			body = append(body, bpf.ALUOpConstant{Op: bpf.ALUOpAnd, Val: uint32(arg.ValueTwo)})
-			fail = bpf.JumpNotEqual
+			// SCMP_CMP_MASKED_EQ takes the mask first and the value to
+			// compare against second: (arg & Value) == ValueTwo. Swapping
+			// the two makes the rule match nothing, which matters because
+			// the default profile allows clone with
+			// (arg0 & CLONE_NEW*) == 0 -- ValueTwo being zero there is not
+			// a mistake, it is the value being compared against.
+			body = append(body, bpf.ALUOpConstant{Op: bpf.ALUOpAnd, Val: uint32(arg.Value)})
+			fail, expect = bpf.JumpNotEqual, uint32(arg.ValueTwo)
 		default:
 			return nil, fmt.Errorf("invalid operator %d in seccomp rule for %s", arg.Op, call.Name)
 		}
 
 		failAt = append(failAt, len(body))
-		body = append(body, bpf.JumpIf{Cond: fail, Val: uint32(arg.Value)})
+		body = append(body, bpf.JumpIf{Cond: fail, Val: expect})
 	}
 
 	body = append(body, bpf.RetConstant{Val: action})

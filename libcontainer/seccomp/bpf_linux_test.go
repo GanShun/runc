@@ -220,7 +220,9 @@ func TestArgumentComparisons(t *testing.T) {
 func TestMaskedEqual(t *testing.T) {
 	arch := nativeAuditArch(t)
 	read := syscallNumber(t, "read")
-	// (arg & 0xff00) == 0x1200
+	// (arg & 0xff00) == 0x1200. The mask is Value and the value compared
+	// against is ValueTwo, which is the order libseccomp's
+	// SCMP_CMP_MASKED_EQ takes.
 	config := &configs.Seccomp{
 		DefaultAction: configs.Errno,
 		Syscalls: []*configs.Syscall{
@@ -228,7 +230,7 @@ func TestMaskedEqual(t *testing.T) {
 				Name:   "read",
 				Action: configs.Allow,
 				Args: []*configs.Arg{
-					{Index: 0, Op: configs.MaskEqualTo, Value: 0x1200, ValueTwo: 0xff00},
+					{Index: 0, Op: configs.MaskEqualTo, Value: 0xff00, ValueTwo: 0x1200},
 				},
 			},
 		},
@@ -238,6 +240,52 @@ func TestMaskedEqual(t *testing.T) {
 	}
 	if ret, want := run(t, config, seccompDataImage(read, arch, 0x1334)), errnoAction(uint32(unix.EPERM)); ret != want {
 		t.Errorf("masked no match: got %#x, want %#x", ret, want)
+	}
+}
+
+// TestMaskedEqualAgainstZero covers the shape containerd's default profile uses
+// to allow clone only when it creates no new namespaces:
+//
+//	(arg0 & CLONE_NEW*) == 0
+//
+// which is (arg0 & Value) == ValueTwo with ValueTwo zero. Reading the operands
+// the other way round makes the rule match nothing, so clone is denied and
+// every fork in the container fails with EPERM. It deserves its own test
+// because a zero operand is easy to mistake for an unset field.
+func TestMaskedEqualAgainstZero(t *testing.T) {
+	arch := nativeAuditArch(t)
+	clone := syscallNumber(t, "clone")
+	namespaceFlags := uint64(unix.CLONE_NEWNS | unix.CLONE_NEWPID | unix.CLONE_NEWNET | unix.CLONE_NEWUSER)
+
+	config := &configs.Seccomp{
+		DefaultAction: configs.Errno,
+		Syscalls: []*configs.Syscall{
+			{
+				Name:   "clone",
+				Action: configs.Allow,
+				Args: []*configs.Arg{
+					{Index: 0, Op: configs.MaskEqualTo, Value: namespaceFlags, ValueTwo: 0},
+				},
+			},
+		},
+	}
+
+	// A plain clone with no namespace flags is what the rule is for.
+	if ret := run(t, config, seccompDataImage(clone, arch, 0)); ret != int(retAllow) {
+		t.Errorf("clone with no flags: got %#x, want allow %#x", ret, int(retAllow))
+	}
+	// Asking for a namespace is not covered, so it gets the default action.
+	if ret, want := run(t, config, seccompDataImage(clone, arch, unix.CLONE_NEWPID)), errnoAction(uint32(unix.EPERM)); ret != want {
+		t.Errorf("clone with CLONE_NEWPID: got %#x, want %#x", ret, want)
+	}
+	// A flag outside the mask is irrelevant -- the rule is about namespace
+	// flags -- so this still matches and is allowed.
+	if ret := run(t, config, seccompDataImage(clone, arch, uint64(unix.SIGCHLD))); ret != int(retAllow) {
+		t.Errorf("clone with SIGCHLD only: got %#x, want allow %#x", ret, int(retAllow))
+	}
+	// Combining it with a namespace flag does not match.
+	if ret, want := run(t, config, seccompDataImage(clone, arch, uint64(unix.SIGCHLD)|unix.CLONE_NEWPID)), errnoAction(uint32(unix.EPERM)); ret != want {
+		t.Errorf("clone with SIGCHLD|CLONE_NEWPID: got %#x, want %#x", ret, want)
 	}
 }
 
