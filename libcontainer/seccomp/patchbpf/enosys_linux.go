@@ -726,11 +726,19 @@ func sysSeccompSetFilter(flags uint, filter []unix.SockFilter) (fd int, err erro
 // patches said filter to handle -ENOSYS in a much nicer manner than the
 // default libseccomp default action behaviour, and loads the patched filter
 // into the kernel for the current process.
-func PatchAndLoad(config *configs.Seccomp, filter *libseccomp.ScmpFilter) (int, error) {
-	// Generate a patched filter.
+func BuildProgram(config *configs.Seccomp, filter *libseccomp.ScmpFilter) ([]unix.SockFilter, error) {
 	fprog, err := enosysPatchFilter(config, filter)
 	if err != nil {
-		return -1, fmt.Errorf("error patching filter: %w", err)
+		return nil, fmt.Errorf("error patching filter: %w", err)
+	}
+	return fprog, nil
+}
+
+func PatchAndLoad(config *configs.Seccomp, filter *libseccomp.ScmpFilter) (int, error) {
+	// Generate a patched filter.
+	fprog, err := BuildProgram(config, filter)
+	if err != nil {
+		return -1, err
 	}
 
 	// Get the set of libseccomp flags set.
