@@ -655,13 +655,22 @@ func (c *Container) newInitProcess(p *Process, cmd *exec.Cmd, comm *processComm)
 	if err != nil {
 		return nil, err
 	}
+	config := c.newInitConfig(p)
+	// The namespaces given by path do not contribute clone flags (see
+	// CloneFlags), so the child has to join them itself; this is where it is
+	// told which. Without cgo that is the only way they are communicated at
+	// all, since the bootstrap message above goes to the C constructor.
+	config.NamespacePaths, err = c.orderNamespacePaths(nsMaps)
+	if err != nil {
+		return nil, err
+	}
 
 	init := &initProcess{
 		containerProcess: containerProcess{
 			cmd:           cmd,
 			comm:          comm,
 			manager:       c.cgroupManager,
-			config:        c.newInitConfig(p),
+			config:        config,
 			process:       p,
 			bootstrapData: data,
 			container:     c,
@@ -681,12 +690,17 @@ func (c *Container) newSetnsProcess(p *Process, cmd *exec.Cmd, comm *processComm
 	if err != nil {
 		return nil, err
 	}
+	config := c.newInitConfig(p)
+	config.NamespacePaths, err = c.orderNamespacePaths(state.NamespacePaths)
+	if err != nil {
+		return nil, err
+	}
 	proc := &setnsProcess{
 		containerProcess: containerProcess{
 			cmd:           cmd,
 			comm:          comm,
 			manager:       c.cgroupManager,
-			config:        c.newInitConfig(p),
+			config:        config,
 			process:       p,
 			bootstrapData: data,
 			container:     c,
