@@ -95,6 +95,13 @@ type initConfig struct {
 	ContainerID string `json:"containerid"`
 	Cgroup2Path string `json:"cgroup2_path,omitempty"`
 
+	// NamespacePaths are the namespaces to join by path, each as
+	// "<kernel name>:<path>" (for example "net:/proc/1234/ns/net"), in the
+	// order they must be joined. The cgo build sends the same list in the
+	// bootstrap message for the C constructor to act on; without cgo there is
+	// no constructor, so the init process joins them itself.
+	NamespacePaths []string `json:"namespace_paths,omitempty"`
+
 	// Networks is filled in from container config by [initProcess.createNetworkInterfaces].
 	Networks []*network `json:"network"`
 
@@ -231,6 +238,14 @@ func startInitialization() (retErr error) {
 
 	var config initConfig
 	if err := json.NewDecoder(initPipe).Decode(&config); err != nil {
+		return err
+	}
+
+	// Join the namespaces the container is given by path, before any of the
+	// setup below touches the network, the hostname or the mounts. With cgo the
+	// C constructor has already done this; without cgo this is the first
+	// opportunity. See joinNamespaces.
+	if err := joinNamespaces(it, config.NamespacePaths); err != nil {
 		return err
 	}
 
