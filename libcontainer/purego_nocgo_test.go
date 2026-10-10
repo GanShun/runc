@@ -3,22 +3,25 @@
 package libcontainer
 
 import (
+	"bufio"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"reflect"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 )
 
-// These tests cover the wiring between runc and the runc-ns helper, not the
-// helper itself (it lives in a separate module and is exercised end to end by
-// the k4s cluster test). They run only without cgo, where stageExecNs is not a
-// no-op, and they need no privileges: the parts under test are the argument,
-// descriptor and report-pipe conventions, which are exactly the parts a
-// protocol change can silently break.
+// These tests cover the wiring between runc and the RuncNsCommand staging
+// stage, not the staging itself: joining a PID namespace needs a container and
+// a real setns(2), so the stage is exercised only by running `runc exec`
+// against one. They run only without cgo, where stageExecNs is not a no-op, and
+// they need no privileges: the parts under test are the argument, descriptor
+// and report-pipe conventions, which are exactly the parts a protocol change
+// can silently break.
 
 func TestSplitPidNamespacePath(t *testing.T) {
 	paths := []string{
@@ -47,19 +50,14 @@ func TestSplitPidNamespacePathNoPid(t *testing.T) {
 	}
 }
 
-// TestStageExecNsWiresHelper asserts the conventions the helper depends on: its
-// argv layout, the init path handed to it, the report descriptor's number, and
-// that the PID path is taken out of the list the init stage joins itself.
-func TestStageExecNsWiresHelper(t *testing.T) {
-	helper := filepath.Join(t.TempDir(), "runc-ns")
-	if err := os.WriteFile(helper, []byte("#!/bin/sh\n"), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	t.Setenv(runcNsHelperEnv, helper)
-
+// TestStageExecNsWiresStage asserts the conventions the staging stage depends
+// on: its argv layout, the init path handed to it, the report descriptor's
+// number, and that the PID path is taken out of the list the init stage joins
+// itself.
+func TestStageExecNsWiresStage(t *testing.T) {
 	paths := []string{"net:/proc/1/ns/net", "pid:/proc/42/ns/pid", "mnt:/proc/1/ns/mnt"}
 	cmd := exec.Command("/runc/self", "init")
-	// runc sets cmd.Args[0] to its own argv[0]; the helper has to carry it
+	// runc sets cmd.Args[0] to its own argv[0]; the stage has to carry it
 	// through as the exec'd init's argv[0] rather than let the descriptor path
 	// become the name.
 	cmd.Args[0] = "runc-own-argv0"
@@ -74,10 +72,15 @@ func TestStageExecNsWiresHelper(t *testing.T) {
 	defer reportParent.Close()
 	defer reportChild.Close()
 
-	if cmd.Path != helper {
-		t.Errorf("cmd.Path = %q, want %q", cmd.Path, helper)
+	// The stage is this binary, re-executed: there is no helper to look up.
+	self, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
 	}
-	wantArgs := []string{helper, "/proc/42/ns/pid", "/runc/self", "runc-own-argv0", "init"}
+	if cmd.Path != self {
+		t.Errorf("cmd.Path = %q, want %q", cmd.Path, self)
+	}
+	wantArgs := []string{self, RuncNsCommand, "/proc/42/ns/pid", "/runc/self", "runc-own-argv0", "init"}
 	if !reflect.DeepEqual(cmd.Args, wantArgs) {
 		t.Errorf("cmd.Args = %v, want %v", cmd.Args, wantArgs)
 	}
@@ -105,6 +108,9 @@ func TestStageExecNsWiresHelper(t *testing.T) {
 // puregoHelperEnv selects the child role in TestPuregoNocgoHelperProcess.
 const puregoHelperEnv = "RUNC_PUREGO_TEST_ROLE"
 
+// puregoArgvEnv names the file the "argv" role writes its own argv to.
+const puregoArgvEnv = "RUNC_PUREGO_TEST_ARGV_FILE"
+
 // TestPuregoNocgoHelperProcess is the child half of the adoption tests below.
 // It is not a real test and does nothing unless the environment selects a role.
 func TestPuregoNocgoHelperProcess(t *testing.T) {
@@ -115,6 +121,15 @@ func TestPuregoNocgoHelperProcess(t *testing.T) {
 		os.Exit(0)
 	case "block":
 		time.Sleep(10 * time.Minute)
+		os.Exit(0)
+	case "argv":
+		// os.Args as this process sees it: the stage passes the caller's argv0
+		// as this process's argv[0], not the path it was exec'd from.
+		body := strings.Join(os.Args, "\n") + "\n"
+		if err := os.WriteFile(os.Getenv(puregoArgvEnv), []byte(body), 0o600); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
 		os.Exit(0)
 	}
 }
@@ -128,6 +143,87 @@ func startPuregoHelper(t *testing.T, role string) *exec.Cmd {
 		t.Fatalf("start helper (%s): %v", role, err)
 	}
 	return cmd
+}
+
+// ppidOf reads the parent pid out of /proc/<pid>/status.
+func ppidOf(t *testing.T, pid int) int {
+	t.Helper()
+	status, err := os.ReadFile(fmt.Sprintf("/proc/%d/status", pid))
+	if err != nil {
+		t.Fatalf("read /proc/%d/status: %v", pid, err)
+	}
+	for _, line := range strings.Split(string(status), "\n") {
+		if rest, ok := strings.CutPrefix(line, "PPid:"); ok {
+			ppid, err := strconv.Atoi(strings.TrimSpace(rest))
+			if err != nil {
+				t.Fatalf("parse %q: %v", line, err)
+			}
+			return ppid
+		}
+	}
+	t.Fatalf("/proc/%d/status has no PPid line", pid)
+	return 0
+}
+
+// TestStartExecNsStageStartsCallerParentedChild runs the second half of the
+// stage -- the os/exec that creates the next stage -- with no setns(2) and no
+// privileges. It covers the two things a re-exec of this binary could silently
+// break: the program is given the caller's argv0 rather than the path it was
+// exec'd from, and the process is created as the *caller's parent's* child
+// (CLONE_PARENT), which is what makes the reported pid one runc can reap.
+func TestStartExecNsStageStartsCallerParentedChild(t *testing.T) {
+	argvFile := filepath.Join(t.TempDir(), "argv")
+	t.Setenv(puregoHelperEnv, "argv")
+	t.Setenv(puregoArgvEnv, argvFile)
+
+	reportParent, reportChild, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reportParent.Close()
+
+	// argv is exactly the layout stageExecNs builds and the stage's runRuncNs
+	// takes as its args[1:]: program, argv0, then the program's own arguments.
+	argv := []string{os.Args[0], "runc-argv0", "-test.run=TestPuregoNocgoHelperProcess"}
+	if err := startExecNsStage(argv, int(reportChild.Fd())); err != nil {
+		t.Fatalf("startExecNsStage: %v", err)
+	}
+	_ = reportChild.Close()
+
+	report, err := bufio.NewReader(reportParent).ReadString('\n')
+	if err != nil {
+		t.Fatalf("read reported pid: %v", err)
+	}
+	pid, err := strconv.Atoi(strings.TrimSpace(report))
+	if err != nil || pid <= 0 {
+		t.Fatalf("reported pid %q is not a pid: %v", report, err)
+	}
+	defer func() { _ = killProcess(pid) }()
+
+	// CLONE_PARENT: the new process's parent is this process's parent, not this
+	// process. It is therefore not this process's to reap, but it is the pid
+	// runc ends up owning when runc is the caller.
+	if want, got := os.Getppid(), ppidOf(t, pid); got != want {
+		t.Errorf("child PPid = %d, want %d (the stage's own parent)", got, want)
+	}
+
+	// The stage reports the pid as soon as the process is created, so the child
+	// may not have written its argv file yet.
+	var body []byte
+	for deadline := time.Now().Add(10 * time.Second); ; {
+		body, err = os.ReadFile(argvFile)
+		if err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("read the child's argv: %v", err)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	want := "runc-argv0\n-test.run=TestPuregoNocgoHelperProcess\n"
+	if string(body) != want {
+		t.Errorf("child argv = %q, want %q", body, want)
+	}
 }
 
 // assertProcessDies waits for cmd to exit after it has been killed, and fails

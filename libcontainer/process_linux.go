@@ -179,17 +179,17 @@ type setnsProcess struct {
 	intelRdtPath    string
 	initProcessPid  int
 
-	// pidReport is the parent's end of the pipe the runc-ns helper reports the
-	// exec'd process's host PID on, and pidReportChild the child's end, which
-	// the helper inherits. Both are nil unless this exec is staged through the
-	// helper; see stageExecNs.
+	// pidReport is the parent's end of the pipe the RuncNsCommand stage reports
+	// the exec'd process's host PID on, and pidReportChild the child's end, which
+	// the stage inherits. Both are nil unless this exec is staged through the
+	// stage; see stageExecNs.
 	pidReport      *os.File
 	pidReportChild *os.File
 }
 
 // closePidReportChild closes the parent's copy of the report pipe's write end.
 // Nothing can be reported once it is closed, so the parent's read then returns
-// EOF rather than waiting for a pid from a helper that has died.
+// EOF rather than waiting for a pid from a stage that has died.
 func (p *setnsProcess) closePidReportChild() {
 	if p.pidReportChild != nil {
 		_ = p.pidReportChild.Close()
@@ -474,8 +474,8 @@ func (p *setnsProcess) startWithCgroupFD() error {
 
 func (p *setnsProcess) start() (retErr error) {
 	defer p.comm.closeParent()
-	// The report pipe's write end belongs to the helper, which inherits its own
-	// copy; the one here is only in the way of the EOF that a helper which dies
+	// The report pipe's write end belongs to the stage, which inherits its own
+	// copy; the one here is only in the way of the EOF that a stage which dies
 	// without reporting has to produce. Closed again -- harmlessly -- just
 	// before the read, for the paths that reach it.
 	defer p.closePidReportChild()
@@ -628,19 +628,19 @@ func (p *setnsProcess) start() (retErr error) {
 // before the go runtime boots, we wait on the process to die and receive the child's pid
 // over the provided pipe.
 func (p *setnsProcess) execSetns() error {
-	// Without cgo the direct child is the runc-ns helper rather than nsexec's
-	// stage 0, so there is no stage1/stage2 pid JSON on the init pipe to wait
-	// for and decode: the helper reports one PID on a pipe of its own and
+	// Without cgo the direct child is the RuncNsCommand stage rather than
+	// nsexec's stage 0, so there is no stage1/stage2 pid JSON on the init pipe to
+	// wait for and decode: the stage reports one PID on a pipe of its own and
 	// exits. See stageExecNs.
 	if p.pidReport != nil {
 		return p.adoptRuncNsChild()
 	}
 	if puregoNamespaces {
-		// No C stage and no helper -- stageExecNs only sets one up when the
-		// container's config has a PID namespace for the init stage to be
-		// placed in, which one built without one does not -- so the direct child
-		// is runc init itself and its PID is the one to manage. This is the same
-		// shape as initProcess.start, and the same reason: there is no
+		// No C stage and no RuncNsCommand stage -- stageExecNs only sets one up
+		// when the container's config has a PID namespace for the init stage to
+		// be placed in, which one built without one does not -- so the direct
+		// child is runc init itself and its PID is the one to manage. This is the
+		// same shape as initProcess.start, and the same reason: there is no
 		// intermediate process to wait for and no pid to decode.
 		p.process.ops = p
 		return nil
@@ -677,17 +677,18 @@ func (p *setnsProcess) execSetns() error {
 	return nil
 }
 
-// adoptRuncNsChild reads the exec'd process's host PID from the runc-ns helper,
-// reaps the helper, and makes the exec'd process the one this Process refers to.
+// adoptRuncNsChild reads the exec'd process's host PID from the RuncNsCommand
+// stage, reaps the stage, and makes the exec'd process the one this Process
+// refers to.
 //
-// The helper started that process itself but made it runc's child rather than
+// The stage started that process itself but made it runc's child rather than
 // its own (CLONE_PARENT), so it is a child of this process: it can be waited for
 // here, and the SIGCHLD loop in runc's main package sees it exit. That is the
 // whole reason for CLONE_PARENT -- the process runc has to report the exit
-// status of is this one, not the helper, which has already done its job.
+// status of is this one, not the stage, which has already done its job.
 func (p *setnsProcess) adoptRuncNsChild() (retErr error) {
-	// The helper holds its own copy of the write end and has already been
-	// started, so the only thing this copy can do now is stop a failed helper
+	// The stage holds its own copy of the write end and has already been
+	// started, so the only thing this copy can do now is stop a failed stage
 	// from showing up as EOF. Close it before reading.
 	p.closePidReportChild()
 	defer p.pidReport.Close()
@@ -701,12 +702,12 @@ func (p *setnsProcess) adoptRuncNsChild() (retErr error) {
 		parseErr = fmt.Errorf("pid %d is not a valid process id", pid)
 	}
 	if parseErr != nil {
-		// The report is not the "<pid>\n" the helper writes, but the helper
+		// The report is not the "<pid>\n" the stage writes, but the stage
 		// creates the exec'd process before it reports anything, so one exists
 		// regardless. A report whose first whitespace-separated field is an
 		// integer still names it, so take that process down rather than leak it.
-		// The report pipe has exactly one writer -- the helper -- so this is
-		// the helper's own pid and not a guess at somebody else's.
+		// The report pipe has exactly one writer -- the stage -- so this is
+		// the stage's own pid and not a guess at somebody else's.
 		if salvage, ok := firstFieldPid(report); ok {
 			_ = killProcess(salvage)
 		}
@@ -714,10 +715,10 @@ func (p *setnsProcess) adoptRuncNsChild() (retErr error) {
 
 	// Once a pid is in hand the exec'd process exists and is runc's child.
 	// Every error below has to kill it: the caller's terminate() aims at
-	// p.cmd.Process, which is still the helper, so simply returning would leave
-	// the exec'd process running with nobody tracking it. The helper guards the
+	// p.cmd.Process, which is still the stage, so simply returning would leave
+	// the exec'd process running with nobody tracking it. The stage guards the
 	// mirror image -- when it cannot report the pid it kills the process it
-	// started (cmd/runc-ns, startStage).
+	// started (libcontainer/runcns_linux.go, startExecNsStage).
 	if parseErr == nil {
 		defer func() {
 			if retErr != nil {
@@ -727,22 +728,22 @@ func (p *setnsProcess) adoptRuncNsChild() (retErr error) {
 	}
 
 	if readErr != nil {
-		// The helper failed before it reported anything. Its exit status is
+		// The stage failed before it reported anything. Its exit status is
 		// the diagnosis -- it prints the reason to stderr, which is the
 		// container's, and exits non-zero.
 		if status, werr := p.cmd.Process.Wait(); werr == nil && status != nil && !status.Success() {
 			return &exec.ExitError{ProcessState: status}
 		}
-		return fmt.Errorf("error reading pid from runc-ns: %w", readErr)
+		return fmt.Errorf("error reading pid reported by %s: %w", RuncNsCommand, readErr)
 	}
 	if parseErr != nil {
-		return fmt.Errorf("error parsing pid %q from runc-ns: %w", report, parseErr)
+		return fmt.Errorf("error parsing pid %q reported by %s: %w", report, RuncNsCommand, parseErr)
 	}
 
-	// Reap the helper before replacing the Process, so nothing is left behind
+	// Reap the stage before replacing the Process, so nothing is left behind
 	// for the wait that is now aimed at the exec'd process.
 	if _, err := p.cmd.Process.Wait(); err != nil {
-		return fmt.Errorf("error waiting on runc-ns to exit: %w", err)
+		return fmt.Errorf("error waiting for the %s stage to exit: %w", RuncNsCommand, err)
 	}
 
 	process, err := os.FindProcess(pid)
@@ -755,7 +756,7 @@ func (p *setnsProcess) adoptRuncNsChild() (retErr error) {
 }
 
 // killProcess sends SIGKILL to pid, best-effort. It exists for the failure
-// paths in adoptRuncNsChild, where a process the helper created has to be taken
+// paths in adoptRuncNsChild, where a process the stage created has to be taken
 // down because nothing adopted it.
 func killProcess(pid int) error {
 	if pid <= 0 {

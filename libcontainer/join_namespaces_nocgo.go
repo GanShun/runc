@@ -46,10 +46,10 @@ import (
 //     children created afterwards (kernel/pid_namespace.c: pidns_install sets
 //     nsproxy->pid_ns_for_children and returns, it does not move the caller), so
 //     nsexec forks and lets the child be created there. A raw fork that carries
-//     on running Go is not available, but a fork that re-execs is: cmd/runc-ns,
+//     on running Go is not available, but a fork that re-execs is: RuncNsCommand,
 //     which arms pid_ns_for_children and then starts the init stage with
 //     os/exec (see stageExecNs in purego_nocgo.go). An exec therefore never
-//     reaches this branch with a PID path: the path is handed to that helper
+//     reaches this branch with a PID path: the path is handed to that stage
 //     and taken out of the list below.
 //
 // The two that cannot be done are refused rather than skipped. Skipping is what
@@ -102,7 +102,7 @@ func joinNamespaces(it initType, paths []string) error {
 			// skipping beats refusing -- refusing would take out exec probes
 			// and kubectl exec as well -- but it is a real loss of isolation,
 			// so it says so.
-			logrus.Warnf("not joining PID namespace %s: not staged by runc-ns, so the process will be in the host's PID namespace", path)
+			logrus.Warnf("not joining PID namespace %s: not staged by %s, so the process will be in the host's PID namespace", path, RuncNsCommand)
 			continue
 		}
 		fd, err := unix.Open(path, unix.O_RDONLY|unix.O_CLOEXEC, 0)

@@ -69,12 +69,12 @@ func (h *signalHandler) forward(process *libcontainer.Process, tty *tty) (int, e
 			_ = tty.resize()
 		case unix.SIGCHLD:
 			// This loop only ever sees a child exit because the child's
-			// exit_signal is SIGCHLD. For an exec staged through runc-ns that
-			// is not automatic: the helper creates the process with
-			// CLONE_PARENT, so the child's exit_signal is the helper's own
+			// exit_signal is SIGCHLD. For an exec staged through RuncNsCommand
+			// that is not automatic: the stage creates the process with
+			// CLONE_PARENT, so the child's exit_signal is the stage's own
 			// (kernel/fork.c:2439-2446), and that is SIGCHLD only because Go's
 			// clone(2) sets it (syscall/exec_linux.go: `flags |=
-			// uintptr(SIGCHLD)`). If the helper stopped being a Go program, or
+			// uintptr(SIGCHLD)`). If the stage stopped being a Go program, or
 			// cloned with another signal, the exec'd process would exit
 			// unreported and "runc exec" would hang.
 			exits, err := h.reap()

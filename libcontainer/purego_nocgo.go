@@ -41,30 +41,15 @@ func setCloneFlags(cmd *exec.Cmd, flags uintptr) {
 	cmd.SysProcAttr.Cloneflags = flags
 }
 
-const (
-	// runcNsHelper is the name the exec staging helper is looked up under on
-	// PATH; runcNsHelperEnv overrides it.
-	runcNsHelper = "runc-ns"
-	// runcNsHelperEnv names an alternative helper, for a build that has it
-	// somewhere PATH does not reach.
-	runcNsHelperEnv = "RUNC_NS"
-	// runcNsReportFdEnv names the descriptor the helper writes the exec'd
-	// process's host PID to. It is an independent string literal on each side
-	// -- here and in the helper's own reportFdEnv -- so renaming one without
-	// the other is a silent protocol break: the parent reads EOF and the exec
-	// fails with nothing to say the name is why.
-	runcNsReportFdEnv = "_LIBCONTAINER_RUNCNS_PIDFD"
-)
-
 // stageExecNs rewrites cmd so that this exec is staged into the container's PID
-// namespace by the runc-ns helper, and returns the parent and child ends of the
-// pipe the helper reports the exec'd process's host PID on, alongside the
-// namespace paths the init stage still has to join itself.
+// namespace by RuncNsCommand, and returns the parent and child ends of the pipe
+// that stage reports the exec'd process's host PID on, alongside the namespace
+// paths the init stage still has to join itself.
 //
 // Why a fork is needed at all: setns(CLONE_NEWPID) does not move the caller. It
 // sets nsproxy->pid_ns_for_children (kernel/pid_namespace.c: pidns_install), so
 // only the caller's next child is created in the container's PID namespace, and
-// execve(2) creates no process. runc-ns is that child-creating step, with an
+// execve(2) creates no process. The stage is that child-creating step, with an
 // execve where nsexec has its second fork: it arms pid_ns_for_children, starts
 // "runc init" with os/exec on the same locked OS thread, and reports the new
 // process's PID. Everything else -- the other namespaces, the rootfs, seccomp,
@@ -74,7 +59,7 @@ const (
 // time runc init exists it is already in that namespace; leaving it in would
 // only make joinNamespaces warn about skipping it.
 //
-// The helper and the pipe are only set up when the container actually has a PID
+// The stage and the pipe are only set up when the container actually has a PID
 // namespace to join. With no PID namespace there is nothing to stage, and the
 // direct child stays runc init.
 func stageExecNs(cmd *exec.Cmd, paths []string) (reportParent, reportChild *os.File, rest []string, err error) {
@@ -83,29 +68,17 @@ func stageExecNs(cmd *exec.Cmd, paths []string) (reportParent, reportChild *os.F
 		return nil, nil, paths, nil
 	}
 
-	helper, err := findRuncNs()
+	// The stage is this same binary, re-executed the way runc re-executes
+	// itself for "init", so there is no second binary to look up or to keep in
+	// step with this one.
+	self, err := os.Executable()
 	if err != nil {
-		return nil, nil, nil, err
-	}
-
-	// The path the helper execs. It is the same path runc would have exec'd
-	// itself, and it resolves inside the helper because the descriptor
-	// numbering does not change across one more exec -- except for the one
-	// case where it names /proc/self/exe, which inside the helper would be the
-	// helper. There, the binary is handed over as a descriptor instead.
-	initExe := cmd.Path
-	if initExe == "/proc/self/exe" {
-		self, err := os.Open("/proc/self/exe")
-		if err != nil {
-			return nil, nil, nil, fmt.Errorf("open /proc/self/exe for runc-ns: %w", err)
-		}
-		cmd.ExtraFiles = append(cmd.ExtraFiles, self)
-		initExe = "/proc/self/fd/" + strconv.Itoa(stdioFdCount+len(cmd.ExtraFiles)-1)
+		return nil, nil, nil, fmt.Errorf("unable to find the runc binary to stage the exec with: %w", err)
 	}
 
 	reportParent, reportChild, err = os.Pipe()
 	if err != nil {
-		return nil, nil, nil, fmt.Errorf("unable to create the runc-ns pid report pipe: %w", err)
+		return nil, nil, nil, fmt.Errorf("unable to create the %s pid report pipe: %w", RuncNsCommand, err)
 	}
 
 	// Appended last, so that every descriptor index computed above -- and every
@@ -113,15 +86,22 @@ func stageExecNs(cmd *exec.Cmd, paths []string) (reportParent, reportChild *os.F
 	cmd.ExtraFiles = append(cmd.ExtraFiles, reportChild)
 	cmd.Env = append(cmd.Env, runcNsReportFdEnv+"="+strconv.Itoa(stdioFdCount+len(cmd.ExtraFiles)-1))
 
-	// The helper is invoked as
-	//   runc-ns <pid-ns-path> <runc> <runc argv0> init [args...]
-	// and execs its own argv[2:] with argv[2] as Path. Passing runc's argv[0]
+	// The stage is invoked as
+	//   runcns <pid-ns-path> <runc> <runc argv0> init [args...]
+	// and execs its own args[1:] with args[1] as Path. Passing runc's argv[0]
 	// separately from the path is what lets the exec'd runc init keep the
 	// argv[0] it would have had as a direct child of runc rather than seeing
 	// the descriptor path as its own name.
+	//
+	// cmd.Path -- the path runc would have exec'd for the init stage -- is
+	// handed over unchanged. It names a sealed copy of this binary through
+	// /proc/self/fd/N, or /proc/self/exe, and either resolves inside the stage:
+	// the descriptor numbering is unchanged across one more exec, and the stage
+	// is this same binary.
+	initExe := cmd.Path
 	runcArgv0 := cmd.Args[0]
-	cmd.Args = append([]string{helper, pidPath, initExe, runcArgv0}, cmd.Args[1:]...)
-	cmd.Path = helper
+	cmd.Args = append([]string{self, RuncNsCommand, pidPath, initExe, runcArgv0}, cmd.Args[1:]...)
+	cmd.Path = self
 
 	return reportParent, reportChild, rest, nil
 }
@@ -138,18 +118,4 @@ func splitPidNamespacePath(paths []string) (rest []string, pidPath string) {
 		rest = append(rest, entry)
 	}
 	return rest, pidPath
-}
-
-// findRuncNs locates the runc-ns helper.
-func findRuncNs() (string, error) {
-	name := os.Getenv(runcNsHelperEnv)
-	if name == "" {
-		name = runcNsHelper
-	}
-	path, err := exec.LookPath(name)
-	if err != nil {
-		return "", fmt.Errorf("unable to find the %s exec helper (set %s to point at one): %w",
-			name, runcNsHelperEnv, err)
-	}
-	return path, nil
 }
