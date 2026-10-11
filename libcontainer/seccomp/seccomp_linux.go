@@ -290,10 +290,13 @@ func matchCall(filter *libseccomp.ScmpFilter, call *configs.Syscall, defAct libs
 	}
 
 	// If we can't resolve the syscall, assume it is not supported
-	// by this kernel. Warn about it, don't error out.
+	// by this kernel. Warn about it, don't error out. The rule is dropped,
+	// and for a deny rule that is a rule that is not enforced, so say so
+	// rather than at debug level where it is invisible.
 	callNum, err := libseccomp.GetSyscallFromName(call.Name)
 	if err != nil {
-		logrus.Debugf("unknown seccomp syscall %q ignored", call.Name)
+		major, minor, micro := Version()
+		logrus.Warnf("seccomp: cannot resolve syscall %q; the rule is dropped and will not be enforced (libseccomp %d.%d.%d does not know the name)", call.Name, major, minor, micro)
 		return nil
 	}
 

@@ -846,7 +846,17 @@ func compileArchSection(config *configs.Seccomp, table map[string]uint32, pseudo
 			// build drops the rule. Dropping it here is what keeps the two
 			// filters the same; the table is generated from libseccomp so that
 			// "cannot resolve" means the same on both sides.
-			logrus.Debugf("unknown seccomp syscall %q on this architecture, ignored", call.Name)
+			//
+			// It is a warning and not a debug message because the drop is
+			// silent otherwise, and a *deny* rule that is dropped is a rule
+			// that is not enforced -- fail-open. The usual cause is a
+			// libseccomp newer than the one the committed table was generated
+			// from, which resolves a name this table lacks; the cgo build then
+			// enforces the rule and this build does not. Matching libseccomp's
+			// drop is deliberate and stays, so the warning is the only signal
+			// an operator gets that the filter is not doing what the profile
+			// says.
+			logrus.Warnf("seccomp: cannot resolve syscall %q for architecture %s; the rule is dropped and will not be enforced (the name is absent from the generated libseccomp table)", call.Name, arch)
 			continue
 		}
 
