@@ -21,8 +21,8 @@ supported rather than merely untested.
 
 It exists because `TestAgainstLibseccomp` compares the two compiled programs in
 the `x/net/bpf` interpreter. That catches a wrong jump, but the interpreter is
-not the kernel, and it skips the cases where the two builds are known to
-disagree -- which is where the interesting differences are.
+not the kernel, and it cannot see anything that is not in the program at all --
+which syscall names resolve, and what the kernel does with the result.
 
 ## Running it
 
