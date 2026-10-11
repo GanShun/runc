@@ -18,9 +18,9 @@ import (
 // This file pins the seven root causes in docs/seccomp-go-vs-libseccomp.md.
 // Each test compiles the exact profile the document measured and asserts what
 // the compiled program does, in the x/net/bpf interpreter, so a regression is
-// caught without a VM. Divergences 1 and 2 are fixed and the tests assert the
-// fixed behaviour; 3 to 7 are not, and those tests pin the current behaviour
-// with a comment naming the divergence and what libseccomp does instead.
+// caught without a VM. All seven are now fixed, and each test asserts the
+// fixed behaviour -- that the cgo-free build does what libseccomp and runc's
+// cgo path do, including where that means refusing or dropping something.
 //
 // The document is a measurement, so the profiles here are copied from it
 // verbatim: a change to one of these tests means the document's numbers no
@@ -95,8 +95,8 @@ func TestDivergence1Socketcall(t *testing.T) {
 		t.Errorf("the x86 section loads the high word of argument 0 %d times; a 32-bit subcall is in the low word", n)
 	}
 	// x86_64 has no multiplexor, so nothing may be added there.
-	if len(pseudoSyscalls["SCMP_ARCH_X86_64"]) != 0 {
-		t.Errorf("the pseudo table has entries for x86_64: %v", pseudoSyscalls["SCMP_ARCH_X86_64"])
+	if len(libseccompPseudo["SCMP_ARCH_X86_64"]) != 0 {
+		t.Errorf("the pseudo table has entries for x86_64: %v", libseccompPseudo["SCMP_ARCH_X86_64"])
 	}
 
 	i386 := uint32(unix.AUDIT_ARCH_I386)
@@ -217,8 +217,10 @@ func TestDivergence2RedundantRuleDropped(t *testing.T) {
 	}
 }
 
-// Divergence 3: the -ENOSYS boundary is computed from each implementation's
-// name table, so a name only the Go table knows moves it. Not fixed.
+// Divergence 3: the -ENOSYS boundary used to be computed from each
+// implementation's own name table. Fixed: the cgo-free compiler resolves names
+// through the table generated from libseccomp, so a name libseccomp cannot
+// resolve does not move the boundary either.
 func TestDivergence3EnosysBoundary(t *testing.T) {
 	skipUnlessAmd64(t)
 	config := &configs.Seccomp{
@@ -234,37 +236,41 @@ func TestDivergence3EnosysBoundary(t *testing.T) {
 		t.Fatalf("compileFilter: %v", err)
 	}
 	validateProgram(t, prog)
-	// The Go table knows statmount (457), so the boundary is 457.
-	if ret := run(t, config, seccompDataImage(456, arch)); ret != errnoAction(uint32(unix.EPERM)) {
-		t.Errorf("nr 456 (below the Go boundary): got %#x, want EPERM", ret)
+	// statmount is a name libseccomp 2.5.5 does not resolve, so the rule is
+	// dropped and the boundary is clone=56, exactly as the cgo build computes
+	// it.
+	if ret := run(t, config, seccompDataImage(55, arch)); ret != errnoAction(uint32(unix.EPERM)) {
+		t.Errorf("nr 55 (below the boundary): got %#x, want EPERM", ret)
 	}
-	if ret := run(t, config, seccompDataImage(458, arch)); ret != int(retErrnoEnosys) {
-		t.Errorf("nr 458 (above the Go boundary): got %#x, want ENOSYS", ret)
+	if ret := run(t, config, seccompDataImage(57, arch)); ret != int(retErrnoEnosys) {
+		t.Errorf("nr 57 (above the boundary): got %#x, want ENOSYS", ret)
 	}
-	// clone3 is the syscall libc probes and falls back from. The document's
-	// measurement: the Go build answers EPERM here, so the fallback to clone
-	// does not happen; libseccomp's boundary is clone=56, so it answers ENOSYS
-	// and the fallback succeeds.
-	if ret := run(t, config, seccompDataImage(435, arch)); ret != errnoAction(uint32(unix.EPERM)) {
-		t.Errorf("clone3: got %#x, want EPERM (Go boundary is 457)", ret)
+	// clone3 is the syscall libc probes and falls back from. ENOSYS is what
+	// makes the fallback to clone -- which this profile allows -- happen, and
+	// it is what both builds must answer.
+	if ret := run(t, config, seccompDataImage(435, arch)); ret != int(retErrnoEnosys) {
+		t.Errorf("clone3: got %#x, want ENOSYS from the boundary at clone", ret)
+	}
+	// The dropped statmount rule does not raise the boundary either.
+	if ret := run(t, config, seccompDataImage(457, arch)); ret != int(retErrnoEnosys) {
+		t.Errorf("statmount: got %#x, want ENOSYS; the rule was dropped", ret)
 	}
 }
 
-// Divergence 4: the Go table (from x/sys/unix) and libseccomp's table have
-// different names. On this checkout the observable direction is that the Go
-// build enforces rules for names libseccomp 2.5.5 does not resolve. Not fixed.
+// Divergence 4: the Go table used to come from x/sys/unix and libseccomp's from
+// its own database, so the two disagreed about names. Fixed: the generated
+// table is extracted from libseccomp, so a name libseccomp cannot resolve is
+// dropped by both builds and a name it resolves is enforced by both.
 func TestDivergence4NameCoverage(t *testing.T) {
 	skipUnlessAmd64(t)
-	// kernNew are named by this checkout's x/sys/unix and not by libseccomp
-	// 2.5.5; only the Go build enforces a rule naming one.
-	kernNew := map[string]uint32{
-		"statmount":        457,
-		"listmount":        458,
-		"lsm_list_modules": 461,
-	}
 	arch := nativeAuditArch(t)
-	for name, nr := range kernNew {
+	// Names this checkout's x/sys/unix has and libseccomp 2.5.5 does not. The
+	// compiler must drop a rule naming one, because the cgo build does.
+	for _, name := range []string{"statmount", "listmount", "lsm_list_modules", "uretprobe"} {
 		t.Run(name, func(t *testing.T) {
+			if _, ok := libseccompSyscalls["SCMP_ARCH_X86_64"][name]; ok {
+				t.Fatalf("the generated table still resolves %q; regenerate it", name)
+			}
 			config := &configs.Seccomp{
 				DefaultAction: configs.Allow,
 				Syscalls: []*configs.Syscall{
@@ -276,36 +282,24 @@ func TestDivergence4NameCoverage(t *testing.T) {
 				t.Fatalf("compileFilter: %v", err)
 			}
 			validateProgram(t, prog)
-			if ret := run(t, config, seccompDataImage(nr, arch)); ret != errnoAction(0) {
-				t.Errorf("%s (%d): got %#x, want ERRNO(0); libseccomp drops the rule and lets it run", name, nr, ret)
+			if ret := run(t, config, seccompDataImage(0, arch)); ret != int(retAllow) {
+				t.Errorf("%s: got %#x, want allow; the rule must be dropped as libseccomp drops it", name, ret)
 			}
 		})
 	}
-	// uretprobe is in the x/sys table but the kernel does not implement it, so
-	// the rule is unobservable in effect; libseccomp 2.5.5 does not know it.
-	if _, ok := syscallNumbers["SCMP_ARCH_X86_64"]["uretprobe"]; !ok {
-		t.Skip("this checkout's x/sys/unix has no uretprobe")
-	}
-	config := &configs.Seccomp{
-		DefaultAction: configs.Allow,
-		Syscalls: []*configs.Syscall{
-			{Name: "uretprobe", Action: configs.Errno, ErrnoRet: new(uint)},
-		},
-	}
-	prog, err := compileFilter(config)
-	if err != nil {
-		t.Fatalf("compileFilter: %v", err)
-	}
-	validateProgram(t, prog)
-	if ret := run(t, config, seccompDataImage(335, arch)); ret != errnoAction(0) {
-		t.Errorf("uretprobe (335): got %#x, want ERRNO(0)", ret)
+	// The reverse direction: a name libseccomp resolves that the kernel-header
+	// tables drop (their generator ignores numbers above 0xffff), so only the
+	// libseccomp-derived table can carry it. ARM's cacheflush (0x0f0002) is the
+	// case the harness cannot see.
+	if nr, ok := libseccompSyscalls["SCMP_ARCH_ARM"]["cacheflush"]; !ok || nr != 0x0f0002 {
+		t.Errorf("arm cacheflush in the generated table is %#x, ok=%v; want 0xf0002", nr, ok)
 	}
 }
 
-// Divergence 5: two conditions on one argument. The Go compiler ANDs them into
-// one rule, so contradictory values make a rule that cannot match; runc's cgo
-// path splits them into two rules, so either value matches. Not fixed: which
-// one a profile author meant is not decidable from the profile.
+// Divergence 5: two conditions on one argument. Fixed: runc's cgo path splits
+// them into separate rules, because libseccomp's db_col_rule_add rejects a
+// second condition on an argument index it has already seen, and the cgo-free
+// compiler now splits the same way. The semantics are OR, not AND.
 func TestDivergence5TwoConditionsOneArgument(t *testing.T) {
 	eacces := uint(unix.EACCES)
 	config := &configs.Seccomp{
@@ -325,71 +319,122 @@ func TestDivergence5TwoConditionsOneArgument(t *testing.T) {
 	arch := nativeAuditArch(t)
 	closeNr := syscallNumber(t, "close")
 	for _, v := range []uint64{12345, 12346} {
-		if ret := run(t, config, seccompDataImage(closeNr, arch, v)); ret != int(retAllow) {
-			t.Errorf("close(%d): got %#x, want allow; the two conditions are ANDed", v, ret)
+		if ret := run(t, config, seccompDataImage(closeNr, arch, v)); ret != errnoAction(uint32(unix.EACCES)) {
+			t.Errorf("close(%d): got %#x, want EACCES; each condition is its own rule", v, ret)
 		}
+	}
+	if ret := run(t, config, seccompDataImage(closeNr, arch, 12347)); ret != int(retAllow) {
+		t.Errorf("close(12347): got %#x, want allow", ret)
 	}
 }
 
 // Divergence 6: with SCMP_ARCH_X32 listed, libseccomp filters x32 numbers
-// through its x32 table; x/sys/unix has no x32 table, so the Go build refuses
-// them with KILL_THREAD. Not fixed; fail-closed.
-func TestDivergence6X32Refused(t *testing.T) {
+// through its own x32 table. Fixed: the generated table carries libseccomp's
+// x32 numbering, so the cgo-free compiler compiles an x32 section and
+// assembleFilter dispatches to it on bit 30 of the syscall number.
+func TestDivergence6X32Filtered(t *testing.T) {
 	skipUnlessAmd64(t)
 	eacces := uint(unix.EACCES)
-	config := &configs.Seccomp{
+	read := syscallNumber(t, "read")
+	getpid := syscallNumber(t, "getpid")
+	amd64 := uint32(unix.AUDIT_ARCH_X86_64)
+
+	listed := &configs.Seccomp{
 		DefaultAction: configs.Allow,
 		Architectures: []string{"x32"},
 		Syscalls: []*configs.Syscall{
 			{Name: "read", Action: configs.Errno, ErrnoRet: &eacces},
 		},
 	}
-	prog, err := compileFilter(config)
+	if nr, ok := libseccompSyscalls["SCMP_ARCH_X32"]["read"]; !ok || nr != read|x32SyscallBit {
+		t.Fatalf("x32 read in the generated table is %#x, ok=%v; want %#x", nr, ok, read|x32SyscallBit)
+	}
+	prog, err := compileFilter(listed)
 	if err != nil {
 		t.Fatalf("compileFilter: %v", err)
 	}
 	validateProgram(t, prog)
-	amd64 := uint32(unix.AUDIT_ARCH_X86_64)
-	read := syscallNumber(t, "read")
-	// An x32 number is killed, not judged. libseccomp would answer EACCES.
-	if ret := run(t, config, seccompDataImage(read|x32SyscallBit, amd64)); ret != int(retKillThread) {
-		t.Errorf("x32 read: got %#x, want KILL_THREAD", ret)
+	if ret := run(t, listed, seccompDataImage(read|x32SyscallBit, amd64)); ret != errnoAction(uint32(unix.EACCES)) {
+		t.Errorf("x32 read with x32 listed: got %#x, want EACCES", ret)
 	}
-	// getpid has no rule, so libseccomp would answer ENOSYS from its x32 table
-	// and the Go build kills it too.
-	getpid := syscallNumber(t, "getpid")
-	if ret := run(t, config, seccompDataImage(getpid|x32SyscallBit, amd64)); ret != int(retKillThread) {
-		t.Errorf("x32 getpid: got %#x, want KILL_THREAD", ret)
+	// getpid does not exist on x32, so libseccomp's x32 table has no number for
+	// it and the rule set has nothing to match: the default action applies and
+	// the kernel answers ENOSYS on its own. Killing it, as the old compiler
+	// did, is a different filter.
+	if ret := run(t, listed, seccompDataImage(getpid|x32SyscallBit, amd64)); ret != int(retAllow) {
+		t.Errorf("x32 getpid with x32 listed: got %#x, want allow", ret)
 	}
-	// The same number without bit 30 is an ordinary x86-64 syscall and gets
-	// the rule.
-	if ret := run(t, config, seccompDataImage(read, amd64)); ret != errnoAction(uint32(unix.EACCES)) {
+	// An ordinary x86-64 read still gets the rule.
+	if ret := run(t, listed, seccompDataImage(read, amd64)); ret != errnoAction(uint32(unix.EACCES)) {
 		t.Errorf("amd64 read: got %#x, want EACCES", ret)
+	}
+	// Without x32 listed an x32 number is still refused, as libseccomp does.
+	unlisted := &configs.Seccomp{DefaultAction: configs.Allow}
+	if _, err := compileFilter(unlisted); err != nil {
+		t.Fatalf("compileFilter: %v", err)
+	}
+	if ret := run(t, unlisted, seccompDataImage(read|x32SyscallBit, amd64)); ret != int(retKillThread) {
+		t.Errorf("x32 read with x32 unlisted: got %#x, want KILL_THREAD", ret)
 	}
 }
 
 // Divergence 7: libseccomp refuses to add an architecture whose byte order
 // differs from the native one, so the cgo build fails to install a filter that
-// lists one; the Go build warns and skips it. Not fixed: availability, not
-// enforcement.
-func TestDivergence7UnusableArchitectureSkipped(t *testing.T) {
+// lists one. Fixed: the cgo-free build refuses the same architectures, with the
+// same error, rather than installing a filter the cgo build would reject.
+func TestDivergence7UnusableArchitectureRefused(t *testing.T) {
+	if runtime.GOARCH != "amd64" || isBigEndian {
+		t.Skip("the case is a big-endian architecture added to a little-endian filter")
+	}
 	config := &configs.Seccomp{
 		DefaultAction: configs.Errno,
 		Architectures: []string{"mips64n32"},
 	}
+	_, err := compileFilter(config)
+	if err == nil {
+		t.Fatal("compileFilter installed a filter for a mips64n32 listing; libseccomp refuses it")
+	}
+	// The cgo build's message for the same condition, word for word: the cgo
+	// path wraps libseccomp's EDOM text, and unix.EDOM renders as the same
+	// string, so the two builds fail identically rather than merely both
+	// failing.
+	want := "error adding architecture to seccomp filter: numerical argument out of domain"
+	if err.Error() != want {
+		t.Errorf("error = %q, want %q", err.Error(), want)
+	}
+	// A little-endian architecture beside the native one is still added.
+	config = &configs.Seccomp{
+		DefaultAction: configs.Errno,
+		Architectures: []string{"mipsel64n32"},
+	}
+	if _, err := compileFilter(config); err != nil {
+		t.Errorf("compileFilter refused little-endian mipsel64n32: %v", err)
+	}
+}
+
+// TestX32PairSharesOneArchiveValue pins the dispatch: two sections share the
+// x86_64 audit value and are reached by testing bit 30 of the syscall number.
+func TestX32PairSharesOneArchiveValue(t *testing.T) {
+	skipUnlessAmd64(t)
+	config := &configs.Seccomp{
+		DefaultAction: configs.Errno,
+		Architectures: []string{"x32"},
+		Syscalls:      []*configs.Syscall{{Name: "read", Action: configs.Allow}},
+	}
 	prog, err := compileFilter(config)
 	if err != nil {
-		t.Fatalf("compileFilter: %v (the Go build must install a filter here)", err)
+		t.Fatalf("compileFilter: %v", err)
 	}
 	validateProgram(t, prog)
-	// There is no table, so no section was compiled for it; the native section
-	// still applies.
-	if _, ok := syscallNumbers["SCMP_ARCH_MIPS64N32"]; ok {
-		t.Fatalf("this checkout has a mips64n32 table, so the test no longer pins the case")
+	if !hasGroup(prog, syscallNumber(t, "read")) {
+		t.Errorf("no x86-64 read group")
 	}
-	arch := nativeAuditArch(t)
-	if ret := run(t, config, seccompDataImage(0, arch)); ret != errnoAction(uint32(unix.EPERM)) {
-		t.Errorf("native syscall under a mips64n32 listing: got %#x, want EPERM", ret)
+	x32read, ok := libseccompSyscalls["SCMP_ARCH_X32"]["read"]
+	if !ok {
+		t.Fatal("no x32 read in the generated table")
+	}
+	if !hasGroup(prog, x32read) {
+		t.Errorf("no x32 read group (%#x)", x32read)
 	}
 }
 

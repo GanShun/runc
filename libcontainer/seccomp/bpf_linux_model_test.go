@@ -27,6 +27,138 @@ import (
 // binary-search-tree rewrite needs in order not to quietly emit a program the
 // verifier rejects.
 
+// modelSection is one architecture's compiled section: the name -> number table
+// and the multiplexor table the generated libseccomp data defines for it.
+type modelSection struct {
+	arch   string
+	table  map[string]uint32
+	pseudo map[string]pseudoSyscall
+}
+
+// modelSections lists the sections a profile produces, in dispatch order: the
+// native architecture first (both builds always include it), then the profile's,
+// each architecture once.
+func modelSections(config *configs.Seccomp) []modelSection {
+	short, err := shortNativeArch()
+	if err != nil {
+		return nil
+	}
+	seen := map[string]bool{}
+	var out []modelSection
+	for _, name := range append([]string{short}, shortArchList(config.Architectures)...) {
+		scmp, ok := scmpArchForShort(name)
+		if !ok {
+			continue
+		}
+		if seen[scmp] {
+			continue
+		}
+		seen[scmp] = true
+		table, pseudo, ok := archSyscallTables(scmp)
+		if !ok {
+			continue
+		}
+		out = append(out, modelSection{arch: scmp, table: table, pseudo: pseudo})
+	}
+	return out
+}
+
+// modelSectionFor picks the section an AUDIT_ARCH value and syscall number land
+// in. Two architectures can share one audit value; only x86_64 and x32 do, and
+// bit 30 of the number says which.
+func modelSectionFor(sections []modelSection, audit uint32, nr uint32) (modelSection, bool) {
+	var candidates []modelSection
+	for _, s := range sections {
+		if auditArch[s.arch] == audit {
+			candidates = append(candidates, s)
+		}
+	}
+	if len(candidates) == 0 {
+		return modelSection{}, false
+	}
+	if nr&x32SyscallBit != 0 {
+		for _, s := range candidates {
+			if s.arch == "SCMP_ARCH_X32" {
+				return s, true
+			}
+		}
+	}
+	for _, s := range candidates {
+		if s.arch != "SCMP_ARCH_X32" {
+			return s, true
+		}
+	}
+	return candidates[0], true
+}
+
+// modelArgIndexesRepeat mirrors hasDuplicateArgIndex without calling it: two
+// conditions naming one argument index is the cue the cgo path splits a rule
+// into one rule per condition.
+func modelArgIndexesRepeat(args []*configs.Arg) bool {
+	var seen [seccompDataArgCount]bool
+	for _, arg := range args {
+		if arg == nil || arg.Index >= seccompDataArgCount {
+			return false
+		}
+		if seen[arg.Index] {
+			return true
+		}
+		seen[arg.Index] = true
+	}
+	return false
+}
+
+// modelPseudoArgs mirrors pseudoRuleArgs: argument 0 becomes the subcall and any
+// condition the profile put on argument 0 is dropped.
+func modelPseudoArgs(subcall uint32, args []*configs.Arg) []*configs.Arg {
+	out := []*configs.Arg{{Index: 0, Op: configs.EqualTo, Value: uint64(subcall)}}
+	for _, arg := range args {
+		if arg.Index == 0 {
+			continue
+		}
+		out = append(out, arg)
+	}
+	return out
+}
+
+// modelRuleMatches decides whether one rule applies to (nr, args) in one
+// section, following what libseccomp does with the rule: a name it resolves to a
+// direct number matches that number; a multiplexed name matches the multiplexor
+// with argument 0 equal to the subcall, and separately the direct-wired number;
+// a name it cannot resolve matches nothing; and two conditions on one argument
+// become two rules, so either value matches.
+func modelRuleMatches(rule *configs.Syscall, sec modelSection, nr uint32, args [seccompDataArgCount]uint64) bool {
+	ps, isPseudo := sec.pseudo[rule.Name]
+	num, inTable := sec.table[rule.Name]
+	if !isPseudo && !inTable {
+		return false
+	}
+	word32 := archIs32Bit[sec.arch]
+
+	conditions := [][]*configs.Arg{rule.Args}
+	if modelArgIndexesRepeat(rule.Args) {
+		conditions = make([][]*configs.Arg, 0, len(rule.Args))
+		for _, arg := range rule.Args {
+			conditions = append(conditions, []*configs.Arg{arg})
+		}
+	}
+	for _, conds := range conditions {
+		if isPseudo {
+			if nr == ps.mux && modelArgsMatch(modelPseudoArgs(ps.subcall, conds), args, word32) {
+				return true
+			}
+			if ps.flat != 0 && nr == ps.flat && modelArgsMatch(conds, args, word32) {
+				return true
+			}
+			continue
+		}
+		if nr == num && modelArgsMatch(conds, args, word32) {
+			return true
+		}
+	}
+	return false
+}
+
 // modelAction evaluates one syscall against a profile the way the kernel should,
 // without reference to the compiled program.
 func modelAction(config *configs.Seccomp, audit uint32, nr uint32, args [seccompDataArgCount]uint64) (uint32, error) {
@@ -35,41 +167,36 @@ func modelAction(config *configs.Seccomp, audit uint32, nr uint32, args [seccomp
 		return 0, err
 	}
 
-	arch, table := modelArchTable(config, audit)
-	if table == nil {
+	sec, ok := modelSectionFor(modelSections(config), audit, nr)
+	if !ok {
 		// No section covers this architecture, so the filter's
 		// bad-architecture action applies: KILL_THREAD, as libseccomp does.
 		return retKillThread, nil
 	}
 
-	// An x32 syscall on x86_64 is refused: seccomp_data.arch cannot tell it
-	// from an x86-64 syscall and there is no x32 table here. libseccomp kills
-	// them when a profile does not list SCMP_ARCH_X32 and filters them through
-	// its x32 table when it does.
-	if audit == unix.AUDIT_ARCH_X86_64 && arch == "SCMP_ARCH_X86_64" &&
-		nr&x32SyscallBit != 0 && nr != ^uint32(0) {
+	// An x32 syscall on the x86_64 ABI is refused when the profile does not list
+	// SCMP_ARCH_X32; when it does, modelSectionFor has already chosen the x32
+	// section for bit-30 numbers.
+	if sec.arch == "SCMP_ARCH_X86_64" && nr&x32SyscallBit != 0 && nr != ^uint32(0) {
 		return retKillThread, nil
 	}
 
 	// The -ENOSYS stub, when the profile is restrictive: a syscall number past
-	// everything the profile mentions is answered with ENOSYS. Stated here
-	// from the profile rather than by asking enosysStub, so that the two can
-	// disagree.
+	// everything the profile mentions is answered with ENOSYS. Stated here from
+	// the profile rather than by asking enosysStub, so that the two can
+	// disagree. The maximum is per section, as patchbpf computes it for the
+	// x86_64/x32 pair.
 	if modelStubApplies(config) {
 		var max uint32
 		for _, rule := range config.Syscalls {
 			if rule == nil {
 				continue
 			}
-			if num, ok := table[rule.Name]; ok && num > max {
+			if num, ok := sec.table[rule.Name]; ok && num > max {
 				max = num
 			}
 		}
-		// The stub skips its check when bit 30 is set: the x86_64 maximum says
-		// nothing about the (much larger) x32 numbers, so it has to. That
-		// includes 0xffffffff, which is how the kernel spells "no syscall".
-		x32Number := audit == unix.AUDIT_ARCH_X86_64 && arch == "SCMP_ARCH_X86_64" && nr&x32SyscallBit != 0
-		if max != 0 && !x32Number && nr > max {
+		if max != 0 && !x32Number(sec, nr) && nr > max {
 			return retErrnoEnosys, nil
 		}
 	}
@@ -78,59 +205,39 @@ func modelAction(config *configs.Seccomp, audit uint32, nr uint32, args [seccomp
 		if rule == nil {
 			return 0, errBadTestProfile
 		}
-		want, ok := table[rule.Name]
-		if !ok || want != nr {
+		action, err := seccompRetAction(rule.Action, rule.ErrnoRet)
+		if err != nil {
+			return 0, err
+		}
+		// The cgo path drops a rule whose action equals the default action.
+		if action == defaultRet {
 			continue
 		}
-		if modelArgsMatch(rule.Args, args, audit&auditArg64Bit == 0) {
-			return seccompRetAction(rule.Action, rule.ErrnoRet)
+		if modelRuleMatches(rule, sec, nr, args) {
+			return action, nil
 		}
 	}
 	return defaultRet, nil
 }
 
+// x32Number reports whether the -ENOSYS stub skips its check for this number.
+// On the x86_64 section, bit 30 marks an x32 syscall, whose numbers say nothing
+// about the x86_64 maximum; that includes 0xffffffff, which is what the stub's
+// guard tests. The x32 section, when the profile lists it, compares bit-30
+// numbers against the x32 maximum and so does not skip them.
+func x32Number(sec modelSection, nr uint32) bool {
+	return sec.arch == "SCMP_ARCH_X86_64" && nr&x32SyscallBit != 0
+}
+
 // modelSyscallNumber is the model's own lookup, which deliberately does not go
 // through normalizeArch or the compiler's helpers.
 func modelSyscallNumber(arch, name string) (uint32, bool) {
-	table, ok := syscallNumbers[arch]
+	table, _, ok := archSyscallTables(arch)
 	if !ok {
 		return 0, false
 	}
 	num, ok := table[name]
 	return num, ok
-}
-
-// modelArchTable picks the architecture section an AUDIT_ARCH value lands in,
-// following the documented rule: the native architecture first, then the
-// profile's list, and the first architecture claiming an AUDIT_ARCH value wins.
-// Names are taken in the short spelling runc's config uses.
-func modelArchTable(config *configs.Seccomp, audit uint32) (string, map[string]uint32) {
-	short, err := shortNativeArch()
-	if err != nil {
-		return "", nil
-	}
-	seen := map[uint32]bool{}
-	for _, name := range append([]string{short}, shortArchList(config.Architectures)...) {
-		scmp, ok := scmpArchForShort(name)
-		if !ok {
-			return "", nil
-		}
-		a := auditArch[scmp]
-		if seen[a] {
-			continue
-		}
-		seen[a] = true
-		table, ok := syscallNumbers[scmp]
-		if !ok {
-			// No table: the compiler leaves this architecture out of the
-			// dispatch entirely.
-			continue
-		}
-		if a == audit {
-			return scmp, table
-		}
-	}
-	return "", nil
 }
 
 // modelStubApplies restates generatePatch's two conditions.
@@ -468,22 +575,28 @@ func syscallNumbersToTry(config *configs.Seccomp, audits []uint32) []uint32 {
 		}
 	}
 	var max uint32
+	sections := modelSections(config)
 	for _, rule := range config.Syscalls {
 		if rule == nil {
 			continue
 		}
 		for _, audit := range audits {
-			_, table := modelArchTable(config, audit)
-			if table == nil {
-				continue
-			}
-			num, ok := table[rule.Name]
-			if !ok {
-				continue
-			}
-			add(num)
-			if num > max {
-				max = num
+			for _, sec := range sections {
+				if auditArch[sec.arch] != audit {
+					continue
+				}
+				if num, ok := sec.table[rule.Name]; ok {
+					add(num)
+					if num > max {
+						max = num
+					}
+				}
+				if ps, ok := sec.pseudo[rule.Name]; ok {
+					add(ps.mux)
+					if ps.flat != 0 {
+						add(ps.flat)
+					}
+				}
 			}
 		}
 	}
@@ -672,14 +785,18 @@ func TestSectionIsATree(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	table := syscallNumbers[archs0(short)]
+	arch := archs0(short)
+	table, pseudo, ok := archSyscallTables(arch)
+	if !ok {
+		t.Fatalf("no syscall table for %s", arch)
+	}
 	config := &configs.Seccomp{DefaultAction: configs.Errno}
 	for name := range table {
 		config.Syscalls = append(config.Syscalls, &configs.Syscall{Name: name, Action: configs.Allow})
 	}
 	rules := len(config.Syscalls)
 
-	section, err := compileArchSection(config, table, pseudoSyscalls[archs0(short)], retErrnoEnosys, auditArch[archs0(short)])
+	section, err := compileArchSection(config, table, pseudo, retErrnoEnosys, arch)
 	if err != nil {
 		t.Fatalf("compileArchSection: %v", err)
 	}

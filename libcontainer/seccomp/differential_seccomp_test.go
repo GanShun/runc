@@ -49,19 +49,6 @@ func TestAgainstLibseccomp(t *testing.T) {
 			var cases, differences int
 			for _, audit := range auditArchesToTry(t, config) {
 				for _, nr := range syscallNumbersToTry(config, []uint32{audit}) {
-					// x32 is the one place this build cannot agree with
-					// libseccomp, because x/sys/unix carries no x32 syscall
-					// table. libseccomp then does one of three things and this
-					// build does none of them: it kills x32 numbers when the
-					// profile does not list SCMP_ARCH_X32, resolves them
-					// against its x32 table when it does, and treats 0xffffffff
-					// as an x32 number when the profile lists x32. Everywhere
-					// else the two agree, including 0xffffffff in a profile
-					// that does not mention x32. This is a deliberate gap,
-					// recorded in docs/nsenter-and-runc.md.
-					if profileListsX32(config) && (isX32Number(nr) || nr == ^uint32(0)) {
-						continue
-					}
 					for _, args := range argSetsToTry(config) {
 						data := seccompDataImage(nr, audit, args[:]...)
 
@@ -147,7 +134,7 @@ func TestAgainstLibseccompPseudoSyscall(t *testing.T) {
 		// multiplexor numbers are what this test is about, so add them.
 		nums := syscallNumbersToTry(config, []uint32{audit})
 		for _, name := range []string{"socket", "msgget"} {
-			if ps, ok := pseudoSyscalls["SCMP_ARCH_X86"][name]; ok {
+			if ps, ok := libseccompPseudo["SCMP_ARCH_X86"][name]; ok {
 				nums = append(nums, ps.mux)
 			}
 		}
@@ -178,9 +165,8 @@ func TestAgainstLibseccompPseudoSyscall(t *testing.T) {
 }
 
 // TestDivergence7LibseccompRefusesArch is the cgo half of the divergence-7
-// pin: the Go compiler installs a filter for a profile that lists an
-// architecture it has no table for, while libseccomp refuses to add the
-// architecture at all. buildFilter is not exported to InitSeccomp, so this only
+// pin: both builds must refuse a profile that lists an architecture libseccomp
+// will not add. buildFilter is not exported to InitSeccomp, so this only
 // compiles a filter; nothing is installed.
 func TestDivergence7LibseccompRefusesArch(t *testing.T) {
 	config := &configs.Seccomp{
@@ -190,8 +176,8 @@ func TestDivergence7LibseccompRefusesArch(t *testing.T) {
 	if _, err := buildFilter(config); err == nil {
 		t.Errorf("libseccomp accepted mips64n32 on amd64, so the divergence is gone")
 	}
-	if _, err := compileFilter(config); err != nil {
-		t.Errorf("the Go compiler refused mips64n32: %v", err)
+	if _, err := compileFilter(config); err == nil {
+		t.Errorf("the Go compiler accepted mips64n32; it must refuse what libseccomp refuses")
 	}
 }
 
@@ -219,21 +205,4 @@ func libseccompProgram(config *configs.Seccomp) ([]bpf.Instruction, error) {
 		return nil, fmt.Errorf("libseccomp produced %d instructions, at least one of which the decoder does not know", len(raw))
 	}
 	return prog, nil
-}
-
-// isX32Number reports whether a syscall number belongs to the x32 ABI, which
-// signals itself with bit 30.
-func isX32Number(nr uint32) bool {
-	return nr&(1<<30) != 0 && nr != ^uint32(0)
-}
-
-// profileListsX32 reports whether a profile asks for the x32 architecture, in
-// either spelling runc's config uses.
-func profileListsX32(config *configs.Seccomp) bool {
-	for _, arch := range config.Architectures {
-		if arch == "x32" || arch == "SCMP_ARCH_X32" {
-			return true
-		}
-	}
-	return false
 }
