@@ -82,7 +82,7 @@ func modelAction(config *configs.Seccomp, audit uint32, nr uint32, args [seccomp
 		if !ok || want != nr {
 			continue
 		}
-		if modelArgsMatch(rule.Args, args) {
+		if modelArgsMatch(rule.Args, args, audit&auditArg64Bit == 0) {
 			return seccompRetAction(rule.Action, rule.ErrnoRet)
 		}
 	}
@@ -145,9 +145,11 @@ func modelStubApplies(config *configs.Seccomp) bool {
 	return true
 }
 
-// modelArgsMatch compares the whole 64-bit argument, as libseccomp does and as
-// the compiler now does.
-func modelArgsMatch(args []*configs.Arg, values [seccompDataArgCount]uint64) bool {
+// modelArgsMatch compares arguments the way the compiler and libseccomp do: the
+// whole 64-bit value on a 64-bit architecture, and only the low 32 bits on a
+// 32-bit one (libseccomp's arch_arg_offset_hi returns EDOM when arch_def.size is
+// ARCH_SIZE_32, so there is no high-word comparison to emit).
+func modelArgsMatch(args []*configs.Arg, values [seccompDataArgCount]uint64, word32 bool) bool {
 	for _, arg := range args {
 		if arg == nil || arg.Index >= seccompDataArgCount {
 			return false
@@ -155,6 +157,11 @@ func modelArgsMatch(args []*configs.Arg, values [seccompDataArgCount]uint64) boo
 		got := values[arg.Index]
 		val := arg.Value
 		valTwo := arg.ValueTwo
+		if word32 {
+			got &= 0xffffffff
+			val &= 0xffffffff
+			valTwo &= 0xffffffff
+		}
 		var ok bool
 		switch arg.Op {
 		case configs.EqualTo:
@@ -655,7 +662,7 @@ func TestSectionIsATree(t *testing.T) {
 	}
 	rules := len(config.Syscalls)
 
-	section, err := compileArchSection(config, table, retErrnoEnosys, auditArch[archs0(short)])
+	section, err := compileArchSection(config, table, pseudoSyscalls[archs0(short)], retErrnoEnosys, auditArch[archs0(short)])
 	if err != nil {
 		t.Fatalf("compileArchSection: %v", err)
 	}

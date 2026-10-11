@@ -227,7 +227,7 @@ func compileFilter(config *configs.Seccomp) ([]bpf.Instruction, error) {
 			logrus.Warnf("seccomp: no syscall table for architecture %q, refusing it rather than filtering it", name)
 			continue
 		}
-		prog, err := compileArchSection(config, table, defaultRet, audit)
+		prog, err := compileArchSection(config, table, pseudoSyscalls[arch], defaultRet, audit)
 		if err != nil {
 			return nil, err
 		}
@@ -441,9 +441,10 @@ func (b *builder) assemble() ([]bpf.Instruction, error) {
 }
 
 // preparedRule is a rule that survived validation, with its action already
-// turned into a SECCOMP_RET_* value.
+// turned into a SECCOMP_RET_* value and its argument conditions detached from
+// the profile, because a multiplexed rule is emitted with rewritten arguments.
 type preparedRule struct {
-	call   *configs.Syscall
+	args   []*configs.Arg
 	action uint32
 }
 
@@ -461,6 +462,9 @@ type ruleGroup struct {
 type treeEmitter struct {
 	b    *builder
 	next int
+	// word32 is set for a 32-bit architecture, whose arguments have no high
+	// word and are compared the way libseccomp compares them.
+	word32 bool
 }
 
 func (t *treeEmitter) newLabel(prefix string) string {
@@ -513,7 +517,7 @@ func (t *treeEmitter) emitGroup(g ruleGroup, defaultLabel string) {
 // emitRule emits one rule: its argument conditions, all of which must hold, and
 // then its action. Control jumps to failLabel as soon as one does not.
 func (t *treeEmitter) emitRule(r preparedRule, failLabel string) {
-	for _, arg := range r.call.Args {
+	for _, arg := range r.args {
 		t.emitCondition(arg, failLabel)
 	}
 	t.b.emit(bpf.RetConstant{Val: r.action})
@@ -529,13 +533,25 @@ func argWordOffset(index uint, high bool) uint32 {
 	return off + argLowOffset()
 }
 
+// auditArg64Bit is __AUDIT_ARCH_64BIT from linux/audit.h, set in the audit
+// architecture value of a 64-bit architecture. libseccomp's arch_arg_offset_hi
+// returns EDOM for an architecture whose arch_def.size is ARCH_SIZE_32, so a
+// 32-bit architecture compares only the low 32 bits of an argument. The bit is
+// right for every architecture this compiler has a syscall table for: the two
+// where it would mislead -- x32 (which shares x86_64's value and is 32-bit) and
+// mips64n32/mipsel64n32 (which set the bit and are 32-bit) -- have no table in
+// x/sys/unix and are refused before a section is compiled.
+const auditArg64Bit = 1 << 31
+
 // emitCondition emits the tests for one argument, jumping to failLabel when the
 // condition does not hold and carrying on when it does.
 //
-// Every condition compares the whole 64-bit argument, which is what libseccomp
-// does and what the profile means. cBPF reads one word at a time, so that means
-// comparing the high half first. Comparing only the low half would match
-// 0x10000002a against a rule for 42; for an allow rule that is fail-open.
+// On a 64-bit architecture the whole 64-bit argument is compared, which is what
+// libseccomp does and what the profile means: comparing only the low half would
+// match 0x10000002a against a rule for 42, and for an allow rule that is
+// fail-open. On a 32-bit architecture there is no high half to compare, and
+// libseccomp compares only the low word, so this does too; cBPF reads one word
+// at a time, so a 64-bit comparison means comparing the high half first.
 func (t *treeEmitter) emitCondition(arg *configs.Arg, failLabel string) {
 	loadHigh := func() {
 		t.b.emit(bpf.LoadAbsolute{Off: argWordOffset(arg.Index, true), Size: 4})
@@ -549,52 +565,64 @@ func (t *treeEmitter) emitCondition(arg *configs.Arg, failLabel string) {
 
 	switch arg.Op {
 	case configs.EqualTo:
-		loadHigh()
-		t.b.jumpIf(bpf.JumpNotEqual, high, failLabel)
+		if !t.word32 {
+			loadHigh()
+			t.b.jumpIf(bpf.JumpNotEqual, high, failLabel)
+		}
 		loadLow()
 		t.b.jumpIf(bpf.JumpNotEqual, low, failLabel)
 
 	case configs.NotEqualTo:
 		// Only fails when both halves are equal.
 		cont := t.newLabel("cont")
-		loadHigh()
-		t.b.jumpIf(bpf.JumpNotEqual, high, cont)
+		if !t.word32 {
+			loadHigh()
+			t.b.jumpIf(bpf.JumpNotEqual, high, cont)
+		}
 		loadLow()
 		t.b.jumpIf(bpf.JumpEqual, low, failLabel)
 		t.b.label(cont)
 
 	case configs.GreaterThan: // arg > value
 		cont := t.newLabel("cont")
-		loadHigh()
-		t.b.jumpIf(bpf.JumpLessThan, high, failLabel)
-		t.b.jumpIf(bpf.JumpGreaterThan, high, cont)
+		if !t.word32 {
+			loadHigh()
+			t.b.jumpIf(bpf.JumpLessThan, high, failLabel)
+			t.b.jumpIf(bpf.JumpGreaterThan, high, cont)
+		}
 		loadLow()
 		t.b.jumpIf(bpf.JumpLessOrEqual, low, failLabel)
 		t.b.label(cont)
 
 	case configs.GreaterThanOrEqualTo: // arg >= value
 		cont := t.newLabel("cont")
-		loadHigh()
-		t.b.jumpIf(bpf.JumpLessThan, high, failLabel)
-		t.b.jumpIf(bpf.JumpGreaterThan, high, cont)
+		if !t.word32 {
+			loadHigh()
+			t.b.jumpIf(bpf.JumpLessThan, high, failLabel)
+			t.b.jumpIf(bpf.JumpGreaterThan, high, cont)
+		}
 		loadLow()
 		t.b.jumpIf(bpf.JumpLessThan, low, failLabel)
 		t.b.label(cont)
 
 	case configs.LessThan: // arg < value
 		cont := t.newLabel("cont")
-		loadHigh()
-		t.b.jumpIf(bpf.JumpGreaterThan, high, failLabel)
-		t.b.jumpIf(bpf.JumpLessThan, high, cont)
+		if !t.word32 {
+			loadHigh()
+			t.b.jumpIf(bpf.JumpGreaterThan, high, failLabel)
+			t.b.jumpIf(bpf.JumpLessThan, high, cont)
+		}
 		loadLow()
 		t.b.jumpIf(bpf.JumpGreaterOrEqual, low, failLabel)
 		t.b.label(cont)
 
 	case configs.LessThanOrEqualTo: // arg <= value
 		cont := t.newLabel("cont")
-		loadHigh()
-		t.b.jumpIf(bpf.JumpGreaterThan, high, failLabel)
-		t.b.jumpIf(bpf.JumpLessThan, high, cont)
+		if !t.word32 {
+			loadHigh()
+			t.b.jumpIf(bpf.JumpGreaterThan, high, failLabel)
+			t.b.jumpIf(bpf.JumpLessThan, high, cont)
+		}
 		loadLow()
 		t.b.jumpIf(bpf.JumpGreaterThan, low, failLabel)
 		t.b.label(cont)
@@ -605,13 +633,31 @@ func (t *treeEmitter) emitCondition(arg *configs.Arg, failLabel string) {
 		// rule match nothing, which matters because the default profile allows
 		// clone with (arg0 & CLONE_NEW*) == 0 -- that zero is the value being
 		// compared against, not an unset field.
-		loadHigh()
-		t.b.emit(bpf.ALUOpConstant{Op: bpf.ALUOpAnd, Val: uint32(arg.Value >> 32)})
-		t.b.jumpIf(bpf.JumpNotEqual, uint32(arg.ValueTwo>>32), failLabel)
+		if !t.word32 {
+			loadHigh()
+			t.b.emit(bpf.ALUOpConstant{Op: bpf.ALUOpAnd, Val: uint32(arg.Value >> 32)})
+			t.b.jumpIf(bpf.JumpNotEqual, uint32(arg.ValueTwo>>32), failLabel)
+		}
 		loadLow()
 		t.b.emit(bpf.ALUOpConstant{Op: bpf.ALUOpAnd, Val: low})
 		t.b.jumpIf(bpf.JumpNotEqual, uint32(arg.ValueTwo), failLabel)
 	}
+}
+
+// pseudoRuleArgs returns the argument conditions for the multiplexed half of a
+// socketcall/ipc rule. libseccomp forces argument 0 to the subcall number and
+// keeps whatever other argument conditions the rule carried, so a condition
+// the profile put on argument 0 is replaced rather than kept.
+func pseudoRuleArgs(subcall uint32, args []*configs.Arg) []*configs.Arg {
+	out := make([]*configs.Arg, 0, len(args)+1)
+	out = append(out, &configs.Arg{Index: 0, Op: configs.EqualTo, Value: uint64(subcall)})
+	for _, arg := range args {
+		if arg.Index == 0 {
+			continue
+		}
+		out = append(out, arg)
+	}
+	return out
 }
 
 // validateArgs rejects an argument list the compiler cannot express.
@@ -636,12 +682,22 @@ func validateArgs(call *configs.Syscall) error {
 }
 
 // compileArchSection compiles the rules for one architecture, ending in the
-// default action.
-func compileArchSection(config *configs.Seccomp, table map[string]uint32, defaultRet uint32, auditArch uint32) ([]bpf.Instruction, error) {
+// default action. table is the architecture's syscall name -> number map, and
+// pseudo its multiplexor table (nil when the architecture has no multiplexor).
+func compileArchSection(config *configs.Seccomp, table map[string]uint32, pseudo map[string]pseudoSyscall, defaultRet uint32, auditArch uint32) ([]bpf.Instruction, error) {
 	// Grouped by syscall number so the tree can be ordered; the rules within a
 	// group keep profile order.
 	index := make(map[uint32]int)
 	var groups []ruleGroup
+
+	addRule := func(num uint32, rule preparedRule) {
+		if at, seen := index[num]; seen {
+			groups[at].rules = append(groups[at].rules, rule)
+			return
+		}
+		index[num] = len(groups)
+		groups = append(groups, ruleGroup{num: num, rules: []preparedRule{rule}})
+	}
 
 	for _, call := range config.Syscalls {
 		if call == nil {
@@ -658,10 +714,16 @@ func compileArchSection(config *configs.Seccomp, table map[string]uint32, defaul
 		if err != nil {
 			return nil, fmt.Errorf("action in seccomp profile is invalid: %w", err)
 		}
-		if action == defaultRet && len(call.Args) == 0 {
-			// Same result as the default action, so the rule cannot change the
-			// outcome. The whole action is compared, not just its kind: two
-			// SCMP_ACT_ERRNO rules returning different errnos differ.
+		if action == defaultRet {
+			// libseccomp's matchCall drops a rule whose action equals the
+			// profile's default action regardless of its arguments: the default
+			// already says what the rule says, so the rule cannot change the
+			// outcome, and keeping it lets it shadow a later, stricter rule for
+			// the same syscall. The whole action is compared, not just its kind:
+			// two SCMP_ACT_ERRNO rules returning different errnos differ.
+			//
+			// This is the same check the libseccomp build makes, so the two
+			// builds agree on which of two rules for one syscall survives.
 			continue
 		}
 		if err := validateArgs(call); err != nil {
@@ -677,20 +739,24 @@ func compileArchSection(config *configs.Seccomp, table map[string]uint32, defaul
 			continue
 		}
 
-		rule := preparedRule{call: call, action: action}
-		if at, seen := index[num]; seen {
-			groups[at].rules = append(groups[at].rules, rule)
-			continue
+		// The direct rule, on the architecture's flat syscall number.
+		addRule(num, preparedRule{args: call.Args, action: action})
+
+		// On an architecture that multiplexes this name, libseccomp emits a
+		// second rule on socketcall(2) or ipc(2), with argument 0 set to the
+		// subcall. Both are needed: old kernels have only the multiplexor and
+		// newer ones accept both, so a filter that covers only one is a hole on
+		// the other.
+		if ps, ok := pseudo[call.Name]; ok {
+			addRule(ps.mux, preparedRule{args: pseudoRuleArgs(ps.subcall, call.Args), action: action})
 		}
-		index[num] = len(groups)
-		groups = append(groups, ruleGroup{num: num, rules: []preparedRule{rule}})
 	}
 
 	sort.Slice(groups, func(i, j int) bool { return groups[i].num < groups[j].num })
 
 	const defaultLabel = "default"
 	b := &builder{}
-	t := &treeEmitter{b: b}
+	t := &treeEmitter{b: b, word32: auditArch&auditArg64Bit == 0}
 	b.emit(bpf.LoadAbsolute{Off: seccompDataNr, Size: 4})
 
 	// On x86_64 only, an x32 syscall has to be recognised by bit 30 of the

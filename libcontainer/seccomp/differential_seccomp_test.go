@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"golang.org/x/net/bpf"
+	"golang.org/x/sys/unix"
 
 	"github.com/opencontainers/runc/libcontainer/configs"
 	"github.com/opencontainers/runc/libcontainer/seccomp/patchbpf"
@@ -87,6 +88,110 @@ func TestAgainstLibseccomp(t *testing.T) {
 			t.Logf("%d cases, %d differences (%d vs %d instructions)",
 				cases, differences, len(ours), len(theirs))
 		})
+	}
+}
+
+// TestAgainstLibseccompPseudoSyscall compares the two compilers on the
+// multiplexed socket and ipc syscalls, which are the divergence-1 case in
+// docs/seccomp-go-vs-libseccomp.md. libseccomp rewrites a rule for `socket` on an
+// architecture that multiplexes it into a rule on socketcall(2) with argument 0
+// equal to SYS_SOCKET, plus the flat syscall number; the compiler has to do the
+// same, and the high-bit argument sets below are what catch a comparison against
+// the wrong half of the argument. The profile is not in modelProfiles because
+// the model does not implement the multiplexor rewrite.
+func TestAgainstLibseccompPseudoSyscall(t *testing.T) {
+	eacces := uint(unix.EACCES)
+	config := &configs.Seccomp{
+		DefaultAction: configs.Allow,
+		Architectures: []string{"x86"},
+		Syscalls: []*configs.Syscall{
+			{Name: "socket", Action: configs.Errno, ErrnoRet: &eacces},
+			{Name: "msgget", Action: configs.Errno, ErrnoRet: &eacces},
+			{Name: "exit", Action: configs.Allow},
+			{Name: "exit_group", Action: configs.Allow},
+		},
+	}
+
+	ours, err := compileFilter(config)
+	if err != nil {
+		t.Fatalf("compileFilter: %v", err)
+	}
+	theirs, err := libseccompProgram(config)
+	if err != nil {
+		t.Fatalf("libseccomp: %v", err)
+	}
+
+	oursVM, err := bpf.NewVM(ours)
+	if err != nil {
+		t.Fatalf("NewVM(ours): %v", err)
+	}
+	theirsVM, err := bpf.NewVM(theirs)
+	if err != nil {
+		t.Fatalf("NewVM(libseccomp): %v", err)
+	}
+
+	var cases, differences int
+	// argSetsToTry is generic and does not know which argument 0 values select
+	// a subcall, so add the ones that matter with high bits set: a 32-bit
+	// architecture has no high word, and a comparison against the full 64-bit
+	// value would wrongly fail to match these.
+	argSets := argSetsToTry(config)
+	for _, v := range []uint64{
+		1<<32 | 1, 1<<32 | 2, 1<<32 | 13, 1<<32 | 18,
+		uint64(^uint32(0))<<32 | 1,
+	} {
+		argSets = append(argSets, [seccompDataArgCount]uint64{v})
+	}
+	for _, audit := range auditArchesToTry(t, config) {
+		// syscallNumbersToTry only knows the profile's flat numbers; the
+		// multiplexor numbers are what this test is about, so add them.
+		nums := syscallNumbersToTry(config, []uint32{audit})
+		for _, name := range []string{"socket", "msgget"} {
+			if ps, ok := pseudoSyscalls["SCMP_ARCH_X86"][name]; ok {
+				nums = append(nums, ps.mux)
+			}
+		}
+		for _, nr := range nums {
+			for _, args := range argSets {
+				data := seccompDataImage(nr, audit, args[:]...)
+				got, err := oursVM.Run(data)
+				if err != nil {
+					t.Fatalf("ours: nr=%d arch=%#x args=%v: %v", nr, audit, args, err)
+				}
+				want, err := theirsVM.Run(data)
+				if err != nil {
+					t.Fatalf("libseccomp: nr=%d arch=%#x args=%v: %v", nr, audit, args, err)
+				}
+				cases++
+				if uint32(got) != uint32(want) {
+					differences++
+					if differences <= 20 {
+						t.Errorf("nr=%d arch=%#x args=%v: ours %#x, libseccomp %#x",
+							nr, audit, args, uint32(got), uint32(want))
+					}
+				}
+			}
+		}
+	}
+	t.Logf("%d cases, %d differences (%d vs %d instructions)",
+		cases, differences, len(ours), len(theirs))
+}
+
+// TestDivergence7LibseccompRefusesArch is the cgo half of the divergence-7
+// pin: the Go compiler installs a filter for a profile that lists an
+// architecture it has no table for, while libseccomp refuses to add the
+// architecture at all. buildFilter is not exported to InitSeccomp, so this only
+// compiles a filter; nothing is installed.
+func TestDivergence7LibseccompRefusesArch(t *testing.T) {
+	config := &configs.Seccomp{
+		DefaultAction: configs.Allow,
+		Architectures: []string{"mips64n32"},
+	}
+	if _, err := buildFilter(config); err == nil {
+		t.Errorf("libseccomp accepted mips64n32 on amd64, so the divergence is gone")
+	}
+	if _, err := compileFilter(config); err != nil {
+		t.Errorf("the Go compiler refused mips64n32: %v", err)
 	}
 }
 
