@@ -339,6 +339,23 @@ func modelProfiles(t *testing.T) map[string]*configs.Seccomp {
 				{Name: "read", Action: configs.Errno},
 			},
 		},
+		"x86-argument-operators": {
+			DefaultAction: configs.Errno,
+			Architectures: []string{"x86"},
+			// Every operator on a 32-bit architecture, where libseccomp
+			// compares only the low word of each argument. This is the profile
+			// that makes TestAgainstLibseccomp exercise every low-word path,
+			// including the high-bit values argSetsToTry adds.
+			Syscalls: []*configs.Syscall{
+				{Name: "read", Action: configs.Allow, Args: []*configs.Arg{{Index: 0, Op: configs.EqualTo, Value: 42}}},
+				{Name: "write", Action: configs.Allow, Args: []*configs.Arg{{Index: 0, Op: configs.NotEqualTo, Value: 42}}},
+				{Name: "close", Action: configs.Allow, Args: []*configs.Arg{{Index: 0, Op: configs.GreaterThan, Value: 42}}},
+				{Name: "openat", Action: configs.Allow, Args: []*configs.Arg{{Index: 0, Op: configs.GreaterThanOrEqualTo, Value: 42}}},
+				{Name: "stat", Action: configs.Allow, Args: []*configs.Arg{{Index: 0, Op: configs.LessThan, Value: 42}}},
+				{Name: "fstat", Action: configs.Allow, Args: []*configs.Arg{{Index: 0, Op: configs.LessThanOrEqualTo, Value: 42}}},
+				{Name: "lseek", Action: configs.Allow, Args: []*configs.Arg{{Index: 0, Op: configs.MaskEqualTo, Value: 0xff00, ValueTwo: 0x1200}}},
+			},
+		},
 		"containerd-shaped": {
 			DefaultAction: configs.Errno,
 			Architectures: []string{"amd64", "x86", "x32"},
