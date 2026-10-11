@@ -89,8 +89,11 @@ var featuresCommand = cli.Command{
 				KnownFlags:     seccomp.KnownFlags(),
 				SupportedFlags: seccomp.SupportedFlags(),
 			}
-			major, minor, patch := seccomp.Version()
-			feat.Annotations[runcfeatures.AnnotationLibseccompVersion] = fmt.Sprintf("%d.%d.%d", major, minor, patch)
+			// All zero means there is no libseccomp in this build (the
+			// cgo-free one), so there is no version to claim.
+			if major, minor, patch := seccomp.Version(); major+minor+patch > 0 {
+				feat.Annotations[runcfeatures.AnnotationLibseccompVersion] = fmt.Sprintf("%d.%d.%d", major, minor, patch)
+			}
 		}
 
 		enc := json.NewEncoder(context.App.Writer)
