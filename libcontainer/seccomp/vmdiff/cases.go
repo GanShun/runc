@@ -492,8 +492,8 @@ func cases() []Case {
 			},
 		},
 		{
-			Name: "duplicate-rules-errno-then-allow",
-			Why:  "the reverse order, which both builds should agree on",
+			Name:          "duplicate-rules-errno-then-allow",
+			Why:           "the reverse order, which both builds should agree on",
 			DefaultAction: configs.Allow,
 			Rules: []Rule{
 				{Name: "close", Action: configs.Errno, HasErrno: true, Errno: errnoEACCES,
@@ -627,28 +627,28 @@ func cases() []Case {
 			Probes:        []string{"i386 getpid", "i386 read(-1)", "i386 socketcall(SOCKET)", "x32 read", "x32 getpid"},
 		},
 		{
-			Name: "name-listmount-block",
+			Name:          "name-listmount-block",
 			Why:           "the same for listmount (458)",
 			DefaultAction: configs.Allow,
 			Rules:         []Rule{{Name: "listmount", Action: configs.Errno, HasErrno: true, Errno: errnoEPERM}},
 			Probes:        []string{"listmount"},
 		},
 		{
-			Name: "name-lsm-list-modules-block",
+			Name:          "name-lsm-list-modules-block",
 			Why:           "the same for lsm_list_modules (461)",
 			DefaultAction: configs.Allow,
 			Rules:         []Rule{{Name: "lsm_list_modules", Action: configs.Errno, HasErrno: true, Errno: errnoEPERM}},
 			Probes:        []string{"lsm_list_modules"},
 		},
 		{
-			Name: "name-futex-wake-block",
+			Name:          "name-futex-wake-block",
 			Why:           "futex_wake (454) exists in the kernel and in libseccomp; control",
 			DefaultAction: configs.Allow,
 			Rules:         []Rule{{Name: "futex_wake", Action: configs.Errno, HasErrno: true, Errno: errnoEPERM}},
 			Probes:        []string{"futex_wake"},
 		},
 		{
-			Name: "name-cachestat-block",
+			Name:          "name-cachestat-block",
 			Why:           "cachestat (451) is in both tables; control",
 			DefaultAction: configs.Allow,
 			Rules:         []Rule{{Name: "cachestat", Action: configs.Errno, HasErrno: true, Errno: errnoEPERM}},
@@ -873,4 +873,3 @@ func die(format string, args ...any) {
 	fmt.Fprintf(os.Stderr, "vmdiff: "+format+"\n", args...)
 	os.Exit(254)
 }
-

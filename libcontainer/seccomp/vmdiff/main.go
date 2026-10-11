@@ -11,12 +11,12 @@ import (
 	"runtime"
 	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
-	"strings"
 	"syscall"
-	"unsafe"
 	"time"
+	"unsafe"
 
 	"golang.org/x/sys/unix"
 
@@ -43,7 +43,7 @@ const (
 	offFlags  = 24 // uint8
 	offErrLen = 25 // uint8
 	offErrMsg = 32
-	offStage  = 27 // how far the child got, written with plain stores
+	offStage  = 27  // how far the child got, written with plain stores
 	offCase   = 256 // the child's own copy of the case name, for alignment
 	caseLen   = 40
 	resPage   = 4096
