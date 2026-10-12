@@ -445,12 +445,13 @@ the native one is still installed, as libseccomp installs it.
 
 One architecture the harness does not cover is loongarch64. This libseccomp
 (2.5.5) has no table for it, so it is absent from the generated
-`libseccompSyscalls` and `archSyscallTables` falls back to the kernel-header
-table, while the cgo build refuses it at `AddArch`. A profile that lists
-loongarch64 on an amd64 host is therefore still enforced by one build and
-rejected by the other. A *native* loongarch64 build has no cgo build to differ
-from, which is why the fallback is there; the honest statement is that this one
-case is outside what this harness measured.
+`libseccompSyscalls`, while the cgo build refuses it at `AddArch`. A profile
+that lists loongarch64 on an amd64 host used to be enforced by the cgo-free
+build (from the kernel-header fallback) and rejected by the cgo build. That is
+now closed: off-native the cgo-free compiler refuses it with an error too, and
+only a *native* loong64 build uses the kernel-header fallback, because its
+numbering is the right one and there is no cgo build to differ from. That native
+path is the one still outside what this harness measured.
 
 ## What agrees
 
@@ -592,13 +593,18 @@ the resulting mismatch visible until someone runs the test.
 
 - **`SECCOMP_FILTER_FLAG_TSYNC` semantics.** The Go build maps the profile's
   `tsync` flag to `SECCOMP_FILTER_FLAG_TSYNC` and otherwise installs with
-  `prctl(2)`, which filters only the calling thread; libseccomp always
-  synchronises all threads. In runc's flow this does not matter -- the filter is
-  installed in the init process and `execve` kills every other thread, leaving
-  the filtered one -- but a *multi-threaded* process that installs a filter
-  without the flag is filtered on every thread by libseccomp and on one thread
-  by the Go build. The harness pins the probe to the installing thread, so it
-  does not measure this. It is worth a separate test.
+  `prctl(2)`, which filters only the calling thread, so a multi-threaded process
+  that does not ask for the flag has only its installing thread filtered. This
+  section used to call that a divergence from the libseccomp build, and it is
+  not: runc's cgo build exports libseccomp's BPF and loads it through
+  `patchbpf`, which drops the `filterAttrTsync` that libseccomp-golang sets, and
+  its `setFlag` never sets the kernel flag. The two builds agree when the
+  profile does not ask for the flag (neither syncs) and differ when it does
+  (only the Go build syncs). In runc's flow this does not matter -- the filter
+  is installed in the init process and `execve` kills every other thread,
+  leaving the filtered one -- and the Go build's half is pinned by
+  `TestFilterSyncsOnlyWhenAsked`. The harness pins the probe to the installing
+  thread, so it does not measure this.
 - **`SCMP_ACT_NOTIFY`.** Both install the listener and both block the notified
   syscall; the harness only confirms the two behave the same, not what an agent
   sees.
