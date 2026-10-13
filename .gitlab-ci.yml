@@ -1,0 +1,46 @@
+# No `tags:` anywhere: the only online runner has an empty tag list.
+stages:
+  - test
+
+image: ubuntu:24.04
+
+variables:
+  GO_VERSION: "1.26.1"
+  LIBSECCOMP_VERSION: "2.5.5"
+
+.toolchain: &toolchain
+  - apt-get update -qq
+  - DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends
+      ca-certificates curl gcc git libc6-dev libseccomp-dev make pkg-config
+  - curl -fsSL "https://go.dev/dl/go${GO_VERSION}.linux-amd64.tar.gz" -o /tmp/go.tar.gz
+  - tar -C /usr/local -xzf /tmp/go.tar.gz
+  - export PATH="/usr/local/go/bin:$PATH"
+  - go version
+
+# An MR pipeline runs for any target branch, since this stack's MRs target each other.
+.rules: &rules
+  - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+  - if: $CI_COMMIT_BRANCH && $CI_OPEN_MERGE_REQUESTS
+    when: never
+  - if: $CI_COMMIT_BRANCH
+
+seccomp-coverage:
+  stage: test
+  rules: *rules
+  before_script: *toolchain
+  script:
+    - make cover
+  coverage: '/coverage: ([0-9]+\.[0-9]+)% of statements/'
+  artifacts:
+    expose_as: 'seccomp coverage'
+    paths:
+      - coverage.html
+    expire_in: 30 days
+
+seccomp-table-drift:
+  stage: test
+  rules: *rules
+  before_script: *toolchain
+  script:
+    - test "$(pkg-config --modversion libseccomp)" = "$LIBSECCOMP_VERSION"
+    - CGO_ENABLED=1 go test -tags seccomp -run TestGeneratedTablesMatchCommitted ./libcontainer/seccomp/

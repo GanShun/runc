@@ -1,4 +1,6 @@
 vendor/pkg
+/coverage.html
+/coverage.out
 /runc
 /runc-*
 /tests/cmd/_bin

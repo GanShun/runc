@@ -252,3 +252,8 @@ verify-dependencies: vendor
 .PHONY: validate-keyring
 validate-keyring:
 	script/keyring_validate.sh
+
+.PHONY: cover
+cover:
+	CGO_ENABLED=0 $(GO) test -covermode=count -coverprofile=coverage.out ./libcontainer/seccomp/
+	$(GO) tool cover -html=coverage.out -o coverage.html
