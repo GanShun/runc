@@ -1,4 +1,4 @@
-//go:build !linux || !cgo || !seccomp
+//go:build !linux || (cgo && !seccomp)
 
 package seccomp
 
@@ -7,21 +7,13 @@ import (
 
 	"github.com/opencontainers/runc/libcontainer/configs"
 	"github.com/opencontainers/runtime-spec/specs-go"
-	"github.com/sirupsen/logrus"
 )
 
 var ErrSeccompNotEnabled = errors.New("seccomp: config provided but seccomp not supported")
 
 // InitSeccomp does nothing because seccomp is not supported.
-//
-// In the cgo-free build it warns and continues (see seccomp_nocgo.go); every
-// other build keeps the fail-closed behaviour.
 func InitSeccomp(config *configs.Seccomp) (int, error) {
 	if config != nil {
-		if ignoreUnsupportedSeccomp {
-			logrus.Warn("seccomp profile requested but runc was built without seccomp (cgo+libseccomp); running WITHOUT seccomp")
-			return -1, nil
-		}
 		return -1, ErrSeccompNotEnabled
 	}
 	return -1, nil
@@ -29,9 +21,6 @@ func InitSeccomp(config *configs.Seccomp) (int, error) {
 
 // FlagSupported tells if a provided seccomp flag is supported.
 func FlagSupported(_ specs.LinuxSeccompFlag) error {
-	if ignoreUnsupportedSeccomp {
-		return nil
-	}
 	return ErrSeccompNotEnabled
 }
 

@@ -131,14 +131,6 @@ func InitSeccomp(config *configs.Seccomp) (int, error) {
 	return seccompFd, nil
 }
 
-type unknownFlagError struct {
-	flag specs.LinuxSeccompFlag
-}
-
-func (e *unknownFlagError) Error() string {
-	return "seccomp flag " + string(e.flag) + " is not known to runc"
-}
-
 func setFlag(filter *libseccomp.ScmpFilter, flag specs.LinuxSeccompFlag) error {
 	switch flag {
 	case flagTsync:
