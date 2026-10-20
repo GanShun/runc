@@ -91,8 +91,9 @@ func modelAction(config *configs.Seccomp, audit uint32, nr uint32, args [seccomp
 //
 //	awk '/^#define __NR_/{print $2, $3}' asm/unistd_64.h
 //
-// The x86_64 table is complete because the every-syscall profile below is built
-// from it; the x86 table carries only the names the profiles that name an x86
+// The x86_64 table is complete; the every-syscall profile built from it skips
+// the names in libseccompNameSkew, which the pinned libseccomp cannot resolve.
+// The x86 table carries only the names the profiles that name an x86
 // section use, and grows when they do. Architectures with no table here (arm64,
 // s390x, and x32, which has no table at all) still fall back to the compiler's
 // generated table in modelSyscallTable: that half of the model is shared data,
@@ -180,6 +181,20 @@ var modelSyscallNumbers = map[string]map[string]uint32{
 	"SCMP_ARCH_X86": {
 		"read": 3, "write": 4, "close": 6, "clone": 120, "openat": 295, "clone3": 435,
 	},
+}
+
+// libseccompNameSkew are syscalls the model's kernel-header table knows but the
+// libseccomp the cgo build pins (2.5.5) cannot resolve; its table stops at
+// futex_requeue (456). A rule naming one is not a filter divergence -- it is a
+// difference in inventory -- so the every-syscall profile leaves them out and
+// the same profile compiles on both sides. Shrink this on a libseccomp bump; it
+// should never grow.
+var libseccompNameSkew = map[string]bool{
+	"statmount":         true, // 457
+	"listmount":         true, // 458
+	"lsm_get_self_attr": true, // 459
+	"lsm_set_self_attr": true, // 460
+	"lsm_list_modules":  true, // 461
 }
 
 // modelSyscallTable returns the model's table for an SCMP_ARCH_* name. The
@@ -345,6 +360,9 @@ func everySyscallRules() []*configs.Syscall {
 	numbers := make([]uint32, 0, len(table))
 	names := make(map[uint32]string, len(table))
 	for name, num := range table {
+		if libseccompNameSkew[name] {
+			continue
+		}
 		numbers = append(numbers, num)
 		names[num] = name
 	}
