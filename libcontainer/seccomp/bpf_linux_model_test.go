@@ -1,0 +1,1192 @@
+//go:build linux
+
+package seccomp
+
+import (
+	"encoding/binary"
+	"math"
+	"runtime"
+	"sort"
+	"testing"
+
+	"golang.org/x/net/bpf"
+	"golang.org/x/sys/unix"
+
+	"github.com/opencontainers/runc/libcontainer/configs"
+)
+
+// This file holds the tests that do not trust the rest of the test suite: an
+// independent model of what a profile means, compared against the compiled
+// program over a grid of inputs, and a static check that the program is one the
+// kernel would accept.
+//
+// Both bugs found so far in the compiler (the architecture names, and the
+// operand order of SCMP_CMP_MASKED_EQ) were invisible to hand-written tests,
+// because those tests encoded the same assumption the compiler did. A model
+// written from the profile semantics rather than from the generated program is
+// what stops that happening again, and static validation is what the upcoming
+// binary-search-tree rewrite needs in order not to quietly emit a program the
+// verifier rejects.
+
+// modelAction evaluates one syscall against a profile the way the kernel should,
+// without reference to the compiled program.
+func modelAction(config *configs.Seccomp, audit uint32, nr uint32, args [seccompDataArgCount]uint64) (uint32, error) {
+	defaultRet, err := seccompRetAction(config.DefaultAction, config.DefaultErrnoRet)
+	if err != nil {
+		return 0, err
+	}
+
+	table := modelArchTable(config, audit)
+	if table == nil {
+		// No section covers this architecture, so the filter's
+		// bad-architecture action applies.
+		return retKillProcess, nil
+	}
+
+	// The -ENOSYS stub, when the profile is restrictive: a syscall number past
+	// everything the profile mentions is answered with ENOSYS. Stated here
+	// from the profile rather than by asking enosysStub, so that the two can
+	// disagree.
+	if modelStubApplies(config) {
+		var max uint32
+		for _, rule := range config.Syscalls {
+			if rule == nil {
+				continue
+			}
+			if num, ok := table[rule.Name]; ok && num > max {
+				max = num
+			}
+		}
+		if max != 0 && nr > max {
+			return retErrnoEnosys, nil
+		}
+	}
+
+	for _, rule := range config.Syscalls {
+		if rule == nil {
+			return 0, errBadTestProfile
+		}
+		want, ok := table[rule.Name]
+		if !ok || want != nr {
+			continue
+		}
+		if modelArgsMatch(rule.Args, args) {
+			return seccompRetAction(rule.Action, rule.ErrnoRet)
+		}
+	}
+	return defaultRet, nil
+}
+
+// modelSyscallNumbers is the model's own syscall name -> number table, so that a
+// wrong number in the compiler's generated table cannot pass by being read from
+// both sides.
+//
+// The numbers are read off the kernel headers installed on the machine the
+// suite was written on -- Debian's linux-libc-dev, kernel 6.x:
+//
+//	x86_64: /usr/include/x86_64-linux-gnu/asm/unistd_64.h
+//	x86:    /usr/include/x86_64-linux-gnu/asm/unistd_32.h
+//
+// extracted with
+//
+//	awk '/^#define __NR_/{print $2, $3}' asm/unistd_64.h
+//
+// The x86_64 table is complete because the every-syscall profile below is built
+// from it; the x86 table carries only the names the profiles that name an x86
+// section use, and grows when they do. Architectures with no table here (arm64,
+// s390x, and x32, which has no table at all) still fall back to the compiler's
+// generated table in modelSyscallTable: that half of the model is shared data,
+// not an independent check, and the fallback says so.
+var modelSyscallNumbers = map[string]map[string]uint32{
+	"SCMP_ARCH_X86_64": {
+		"read": 0, "write": 1, "open": 2, "close": 3, "stat": 4, "fstat": 5, "lstat": 6, "poll": 7,
+		"lseek": 8, "mmap": 9, "mprotect": 10, "munmap": 11, "brk": 12, "rt_sigaction": 13,
+		"rt_sigprocmask": 14, "rt_sigreturn": 15, "ioctl": 16, "pread64": 17, "pwrite64": 18,
+		"readv": 19, "writev": 20, "access": 21, "pipe": 22, "select": 23, "sched_yield": 24,
+		"mremap": 25, "msync": 26, "mincore": 27, "madvise": 28, "shmget": 29, "shmat": 30,
+		"shmctl": 31, "dup": 32, "dup2": 33, "pause": 34, "nanosleep": 35, "getitimer": 36,
+		"alarm": 37, "setitimer": 38, "getpid": 39, "sendfile": 40, "socket": 41, "connect": 42,
+		"accept": 43, "sendto": 44, "recvfrom": 45, "sendmsg": 46, "recvmsg": 47, "shutdown": 48,
+		"bind": 49, "listen": 50, "getsockname": 51, "getpeername": 52, "socketpair": 53,
+		"setsockopt": 54, "getsockopt": 55, "clone": 56, "fork": 57, "vfork": 58, "execve": 59,
+		"exit": 60, "wait4": 61, "kill": 62, "uname": 63, "semget": 64, "semop": 65, "semctl": 66,
+		"shmdt": 67, "msgget": 68, "msgsnd": 69, "msgrcv": 70, "msgctl": 71, "fcntl": 72, "flock": 73,
+		"fsync": 74, "fdatasync": 75, "truncate": 76, "ftruncate": 77, "getdents": 78, "getcwd": 79,
+		"chdir": 80, "fchdir": 81, "rename": 82, "mkdir": 83, "rmdir": 84, "creat": 85, "link": 86,
+		"unlink": 87, "symlink": 88, "readlink": 89, "chmod": 90, "fchmod": 91, "chown": 92,
+		"fchown": 93, "lchown": 94, "umask": 95, "gettimeofday": 96, "getrlimit": 97, "getrusage": 98,
+		"sysinfo": 99, "times": 100, "ptrace": 101, "getuid": 102, "syslog": 103, "getgid": 104,
+		"setuid": 105, "setgid": 106, "geteuid": 107, "getegid": 108, "setpgid": 109, "getppid": 110,
+		"getpgrp": 111, "setsid": 112, "setreuid": 113, "setregid": 114, "getgroups": 115,
+		"setgroups": 116, "setresuid": 117, "getresuid": 118, "setresgid": 119, "getresgid": 120,
+		"getpgid": 121, "setfsuid": 122, "setfsgid": 123, "getsid": 124, "capget": 125, "capset": 126,
+		"rt_sigpending": 127, "rt_sigtimedwait": 128, "rt_sigqueueinfo": 129, "rt_sigsuspend": 130,
+		"sigaltstack": 131, "utime": 132, "mknod": 133, "uselib": 134, "personality": 135,
+		"ustat": 136, "statfs": 137, "fstatfs": 138, "sysfs": 139, "getpriority": 140,
+		"setpriority": 141, "sched_setparam": 142, "sched_getparam": 143, "sched_setscheduler": 144,
+		"sched_getscheduler": 145, "sched_get_priority_max": 146, "sched_get_priority_min": 147,
+		"sched_rr_get_interval": 148, "mlock": 149, "munlock": 150, "mlockall": 151, "munlockall": 152,
+		"vhangup": 153, "modify_ldt": 154, "pivot_root": 155, "_sysctl": 156, "prctl": 157,
+		"arch_prctl": 158, "adjtimex": 159, "setrlimit": 160, "chroot": 161, "sync": 162, "acct": 163,
+		"settimeofday": 164, "mount": 165, "umount2": 166, "swapon": 167, "swapoff": 168,
+		"reboot": 169, "sethostname": 170, "setdomainname": 171, "iopl": 172, "ioperm": 173,
+		"create_module": 174, "init_module": 175, "delete_module": 176, "get_kernel_syms": 177,
+		"query_module": 178, "quotactl": 179, "nfsservctl": 180, "getpmsg": 181, "putpmsg": 182,
+		"afs_syscall": 183, "tuxcall": 184, "security": 185, "gettid": 186, "readahead": 187,
+		"setxattr": 188, "lsetxattr": 189, "fsetxattr": 190, "getxattr": 191, "lgetxattr": 192,
+		"fgetxattr": 193, "listxattr": 194, "llistxattr": 195, "flistxattr": 196, "removexattr": 197,
+		"lremovexattr": 198, "fremovexattr": 199, "tkill": 200, "time": 201, "futex": 202,
+		"sched_setaffinity": 203, "sched_getaffinity": 204, "set_thread_area": 205, "io_setup": 206,
+		"io_destroy": 207, "io_getevents": 208, "io_submit": 209, "io_cancel": 210,
+		"get_thread_area": 211, "lookup_dcookie": 212, "epoll_create": 213, "epoll_ctl_old": 214,
+		"epoll_wait_old": 215, "remap_file_pages": 216, "getdents64": 217, "set_tid_address": 218,
+		"restart_syscall": 219, "semtimedop": 220, "fadvise64": 221, "timer_create": 222,
+		"timer_settime": 223, "timer_gettime": 224, "timer_getoverrun": 225, "timer_delete": 226,
+		"clock_settime": 227, "clock_gettime": 228, "clock_getres": 229, "clock_nanosleep": 230,
+		"exit_group": 231, "epoll_wait": 232, "epoll_ctl": 233, "tgkill": 234, "utimes": 235,
+		"vserver": 236, "mbind": 237, "set_mempolicy": 238, "get_mempolicy": 239, "mq_open": 240,
+		"mq_unlink": 241, "mq_timedsend": 242, "mq_timedreceive": 243, "mq_notify": 244,
+		"mq_getsetattr": 245, "kexec_load": 246, "waitid": 247, "add_key": 248, "request_key": 249,
+		"keyctl": 250, "ioprio_set": 251, "ioprio_get": 252, "inotify_init": 253,
+		"inotify_add_watch": 254, "inotify_rm_watch": 255, "migrate_pages": 256, "openat": 257,
+		"mkdirat": 258, "mknodat": 259, "fchownat": 260, "futimesat": 261, "newfstatat": 262,
+		"unlinkat": 263, "renameat": 264, "linkat": 265, "symlinkat": 266, "readlinkat": 267,
+		"fchmodat": 268, "faccessat": 269, "pselect6": 270, "ppoll": 271, "unshare": 272,
+		"set_robust_list": 273, "get_robust_list": 274, "splice": 275, "tee": 276,
+		"sync_file_range": 277, "vmsplice": 278, "move_pages": 279, "utimensat": 280,
+		"epoll_pwait": 281, "signalfd": 282, "timerfd_create": 283, "eventfd": 284, "fallocate": 285,
+		"timerfd_settime": 286, "timerfd_gettime": 287, "accept4": 288, "signalfd4": 289,
+		"eventfd2": 290, "epoll_create1": 291, "dup3": 292, "pipe2": 293, "inotify_init1": 294,
+		"preadv": 295, "pwritev": 296, "rt_tgsigqueueinfo": 297, "perf_event_open": 298,
+		"recvmmsg": 299, "fanotify_init": 300, "fanotify_mark": 301, "prlimit64": 302,
+		"name_to_handle_at": 303, "open_by_handle_at": 304, "clock_adjtime": 305, "syncfs": 306,
+		"sendmmsg": 307, "setns": 308, "getcpu": 309, "process_vm_readv": 310,
+		"process_vm_writev": 311, "kcmp": 312, "finit_module": 313, "sched_setattr": 314,
+		"sched_getattr": 315, "renameat2": 316, "seccomp": 317, "getrandom": 318, "memfd_create": 319,
+		"kexec_file_load": 320, "bpf": 321, "execveat": 322, "userfaultfd": 323, "membarrier": 324,
+		"mlock2": 325, "copy_file_range": 326, "preadv2": 327, "pwritev2": 328, "pkey_mprotect": 329,
+		"pkey_alloc": 330, "pkey_free": 331, "statx": 332, "io_pgetevents": 333, "rseq": 334,
+		"pidfd_send_signal": 424, "io_uring_setup": 425, "io_uring_enter": 426,
+		"io_uring_register": 427, "open_tree": 428, "move_mount": 429, "fsopen": 430, "fsconfig": 431,
+		"fsmount": 432, "fspick": 433, "pidfd_open": 434, "clone3": 435, "close_range": 436,
+		"openat2": 437, "pidfd_getfd": 438, "faccessat2": 439, "process_madvise": 440,
+		"epoll_pwait2": 441, "mount_setattr": 442, "quotactl_fd": 443, "landlock_create_ruleset": 444,
+		"landlock_add_rule": 445, "landlock_restrict_self": 446, "memfd_secret": 447,
+		"process_mrelease": 448, "futex_waitv": 449, "set_mempolicy_home_node": 450, "cachestat": 451,
+		"fchmodat2": 452, "map_shadow_stack": 453, "futex_wake": 454, "futex_wait": 455,
+		"futex_requeue": 456, "statmount": 457, "listmount": 458, "lsm_get_self_attr": 459,
+		"lsm_set_self_attr": 460, "lsm_list_modules": 461,
+	},
+	"SCMP_ARCH_X86": {
+		"read": 3, "write": 4, "close": 6, "clone": 120, "openat": 295, "clone3": 435,
+	},
+}
+
+// modelSyscallTable returns the model's table for an SCMP_ARCH_* name. The
+// architectures above come from the model's own numbers; the rest fall back to
+// the compiler's generated table, because reading thirty other architectures'
+// numbers off headers is not what this test is for. A fallback here is shared
+// data and catches nothing, which is why it is only the architectures no profile
+// names.
+func modelSyscallTable(scmp string) (map[string]uint32, bool) {
+	if table, ok := modelSyscallNumbers[scmp]; ok {
+		return table, true
+	}
+	table, ok := syscallNumbers[scmp]
+	return table, ok
+}
+
+// modelArchTable picks the architecture section an AUDIT_ARCH value lands in,
+// following the documented rule: the native architecture first, then the
+// profile's list, and the first architecture claiming an AUDIT_ARCH value wins.
+// Names are taken in the short spelling runc's config uses.
+func modelArchTable(config *configs.Seccomp, audit uint32) map[string]uint32 {
+	short, err := shortNativeArch()
+	if err != nil {
+		return nil
+	}
+	seen := map[uint32]bool{}
+	for _, name := range append([]string{short}, shortArchList(config.Architectures)...) {
+		scmp, ok := scmpArchForShort(name)
+		if !ok {
+			return nil
+		}
+		a := auditArch[scmp]
+		if seen[a] {
+			continue
+		}
+		seen[a] = true
+		table, ok := modelSyscallTable(scmp)
+		if !ok {
+			// No table: the compiler leaves this architecture out of the
+			// dispatch entirely.
+			continue
+		}
+		if a == audit {
+			return table
+		}
+	}
+	return nil
+}
+
+// modelStubApplies restates generatePatch's two conditions.
+func modelStubApplies(config *configs.Seccomp) bool {
+	if config.DefaultErrnoRet != nil && uint32(*config.DefaultErrnoRet)&retDataMask == retErrnoEnosys&retDataMask {
+		return false
+	}
+	switch config.DefaultAction {
+	case configs.Allow, configs.Log, configs.Trace:
+		return false
+	}
+	return true
+}
+
+// modelArgsMatch compares only the low 32 bits, as the kernel does.
+func modelArgsMatch(args []*configs.Arg, values [seccompDataArgCount]uint64) bool {
+	for _, arg := range args {
+		if arg == nil || arg.Index >= seccompDataArgCount {
+			return false
+		}
+		got := uint32(values[arg.Index])
+		val := uint32(arg.Value)
+		valTwo := uint32(arg.ValueTwo)
+		var ok bool
+		switch arg.Op {
+		case configs.EqualTo:
+			ok = got == val
+		case configs.NotEqualTo:
+			ok = got != val
+		case configs.GreaterThan:
+			ok = got > val
+		case configs.GreaterThanOrEqualTo:
+			ok = got >= val
+		case configs.LessThan:
+			ok = got < val
+		case configs.LessThanOrEqualTo:
+			ok = got <= val
+		case configs.MaskEqualTo:
+			// Mask first, then the value to compare against.
+			ok = got&val == valTwo
+		}
+		if !ok {
+			return false
+		}
+	}
+	return true
+}
+
+var errBadTestProfile = errorString("test profile has a nil syscall")
+
+type errorString string
+
+func (e errorString) Error() string { return string(e) }
+
+// shortNativeArch is the native architecture in the short spelling that
+// configs.Seccomp uses.
+func shortNativeArch() (string, error) {
+	scmp, err := nativeSeccompArch()
+	if err != nil {
+		return "", err
+	}
+	short, ok := archs[scmp]
+	if !ok {
+		return "", errBadTestProfile
+	}
+	return short, nil
+}
+
+// shortArchList maps a mixed list of architecture spellings to short names.
+func shortArchList(names []string) []string {
+	out := make([]string, 0, len(names))
+	for _, name := range names {
+		if short, ok := archs[name]; ok {
+			out = append(out, short)
+			continue
+		}
+		out = append(out, name)
+	}
+	return out
+}
+
+// scmpArchForShort maps a short architecture name back to its SCMP_ARCH_* name,
+// accepting either spelling.
+func scmpArchForShort(name string) (string, bool) {
+	if _, ok := auditArch[name]; ok {
+		return name, true
+	}
+	for scmp, short := range archs {
+		if short == name {
+			return scmp, true
+		}
+	}
+	return "", false
+}
+
+// everySyscallProfile is the name of the profile with one rule per syscall number
+// the model knows. It is the only profile large enough for a jump in the
+// compiled program to exceed cBPF's 255-instruction reach, so it is the only
+// behavioural test of the widening path in assemble, and TestAgainstModel sweeps
+// every syscall number for it rather than a handful.
+const everySyscallProfile = "every-syscall"
+
+// everySyscallRules is one allow rule per syscall in the model's own table for
+// the native architecture, in number order so the profile does not depend on map
+// iteration order. On an architecture the model has no table for there is nothing
+// to build the profile from, so it is empty there and proves nothing.
+func everySyscallRules() []*configs.Syscall {
+	scmp, err := nativeSeccompArch()
+	if err != nil {
+		return nil
+	}
+	table, ok := modelSyscallNumbers[scmp]
+	if !ok {
+		return nil
+	}
+	numbers := make([]uint32, 0, len(table))
+	names := make(map[uint32]string, len(table))
+	for name, num := range table {
+		numbers = append(numbers, num)
+		names[num] = name
+	}
+	sort.Slice(numbers, func(i, j int) bool { return numbers[i] < numbers[j] })
+
+	rules := make([]*configs.Syscall, 0, len(numbers))
+	for _, num := range numbers {
+		rules = append(rules, &configs.Syscall{Name: names[num], Action: configs.Allow})
+	}
+	return rules
+}
+
+// modelProfiles is the set of profiles every structural test runs over.
+func modelProfiles(t *testing.T) map[string]*configs.Seccomp {
+	t.Helper()
+	errno := uint(unix.ENOSYS)
+	return map[string]*configs.Seccomp{
+		"errno-default-only": {
+			DefaultAction: configs.Errno,
+		},
+		"allow-list": {
+			DefaultAction: configs.Errno,
+			Syscalls: []*configs.Syscall{
+				{Name: "read", Action: configs.Allow},
+				{Name: "write", Action: configs.Allow},
+				{Name: "close", Action: configs.Allow},
+				{Name: "openat", Action: configs.Allow},
+			},
+		},
+		"permissive-default": {
+			DefaultAction: configs.Allow,
+			Syscalls: []*configs.Syscall{
+				{Name: "read", Action: configs.Errno},
+				{Name: "write", Action: configs.KillProcess},
+			},
+		},
+		"distinct-errnos": {
+			DefaultAction: configs.Errno,
+			Syscalls: []*configs.Syscall{
+				{Name: "read", Action: configs.Errno, ErrnoRet: &errno},
+				{Name: "close", Action: configs.Errno, ErrnoRet: new(uint)},
+			},
+		},
+		"every-action": {
+			DefaultAction: configs.Allow,
+			Syscalls: []*configs.Syscall{
+				{Name: "read", Action: configs.Kill},
+				{Name: "write", Action: configs.KillProcess},
+				{Name: "close", Action: configs.Trap},
+				{Name: "openat", Action: configs.Log},
+				{Name: "stat", Action: configs.Trace},
+				{Name: "fstat", Action: configs.Notify},
+			},
+		},
+		"argument-operators": {
+			DefaultAction: configs.Errno,
+			Syscalls: []*configs.Syscall{
+				{Name: "read", Action: configs.Allow, Args: []*configs.Arg{{Index: 0, Op: configs.EqualTo, Value: 42}}},
+				{Name: "write", Action: configs.Allow, Args: []*configs.Arg{{Index: 0, Op: configs.NotEqualTo, Value: 42}}},
+				{Name: "close", Action: configs.Allow, Args: []*configs.Arg{{Index: 0, Op: configs.GreaterThan, Value: 42}}},
+				{Name: "openat", Action: configs.Allow, Args: []*configs.Arg{{Index: 0, Op: configs.GreaterThanOrEqualTo, Value: 42}}},
+				{Name: "stat", Action: configs.Allow, Args: []*configs.Arg{{Index: 0, Op: configs.LessThan, Value: 42}}},
+				{Name: "fstat", Action: configs.Allow, Args: []*configs.Arg{{Index: 0, Op: configs.LessThanOrEqualTo, Value: 42}}},
+				{Name: "lseek", Action: configs.Allow, Args: []*configs.Arg{{Index: 1, Op: configs.EqualTo, Value: 7}}},
+			},
+		},
+		"masked-equal": {
+			DefaultAction: configs.Errno,
+			Syscalls: []*configs.Syscall{
+				// The shape containerd's default profile uses for clone.
+				{
+					Name:   "clone",
+					Action: configs.Allow,
+					Args: []*configs.Arg{{
+						Index:    0,
+						Op:       configs.MaskEqualTo,
+						Value:    uint64(unix.CLONE_NEWNS | unix.CLONE_NEWPID | unix.CLONE_NEWUSER),
+						ValueTwo: 0,
+					}},
+				},
+				{
+					Name:   "read",
+					Action: configs.Allow,
+					Args: []*configs.Arg{{
+						Index:    0,
+						Op:       configs.MaskEqualTo,
+						Value:    0xff00,
+						ValueTwo: 0x1200,
+					}},
+				},
+			},
+		},
+		"two-conditions": {
+			DefaultAction: configs.Errno,
+			Syscalls: []*configs.Syscall{
+				{
+					Name:   "read",
+					Action: configs.Allow,
+					Args: []*configs.Arg{
+						{Index: 0, Op: configs.EqualTo, Value: 1},
+						{Index: 1, Op: configs.GreaterThan, Value: 5},
+					},
+				},
+			},
+		},
+		"extra-architectures": {
+			DefaultAction: configs.Errno,
+			Architectures: []string{"x86", "x32"},
+			Syscalls:      []*configs.Syscall{{Name: "read", Action: configs.Allow}, {Name: "close", Action: configs.Allow}},
+		},
+		"duplicate-syscall": {
+			DefaultAction: configs.Errno,
+			Syscalls: []*configs.Syscall{
+				{Name: "read", Action: configs.Allow, Args: []*configs.Arg{{Index: 0, Op: configs.EqualTo, Value: 9}}},
+				{Name: "read", Action: configs.Errno},
+			},
+		},
+		"containerd-shaped": {
+			DefaultAction: configs.Errno,
+			Architectures: []string{"amd64", "x86", "x32"},
+			Syscalls: []*configs.Syscall{
+				{Name: "read", Action: configs.Allow},
+				{Name: "write", Action: configs.Allow},
+				{Name: "close", Action: configs.Allow},
+				{Name: "openat", Action: configs.Allow},
+				{Name: "clone", Action: configs.Allow, Args: []*configs.Arg{{
+					Index:    0,
+					Op:       configs.MaskEqualTo,
+					Value:    uint64(unix.CLONE_NEWNS | unix.CLONE_NEWPID | unix.CLONE_NEWNET | unix.CLONE_NEWUSER | unix.CLONE_NEWIPC | unix.CLONE_NEWUTS | unix.CLONE_NEWCGROUP),
+					ValueTwo: 0,
+				}}},
+				{Name: "clone3", Action: configs.Errno, ErrnoRet: &errno},
+			},
+		},
+		// Every syscall, so that the jumps the search tree emits are long
+		// enough to need widening. Every other profile here is a handful of
+		// rules and a forty-instruction program, where assemble's second
+		// path cannot run at all. TestProgramsWellFormed replaces this
+		// entry with the compiler's own table for its structural check.
+		everySyscallProfile: {
+			DefaultAction: configs.Errno,
+			Syscalls:      everySyscallRules(),
+		},
+	}
+}
+
+// TestAgainstModel compiles every profile and compares the program's behaviour
+// with the model's over a grid of architectures, syscall numbers and argument
+// values.
+func TestAgainstModel(t *testing.T) {
+	for name, config := range modelProfiles(t) {
+		t.Run(name, func(t *testing.T) {
+			prog, err := compileFilter(config)
+			if err != nil {
+				t.Fatalf("compileFilter: %v", err)
+			}
+			validateProgram(t, prog)
+
+			audits := auditArchesToTry(t, config)
+			numbers := syscallNumbersToTry(config, audits)
+			if name == everySyscallProfile {
+				// Every number, not a handful: with this profile the tree is
+				// deep enough that a jump needs the 32-bit form, and a
+				// mistake in that form is a wrong verdict at some number in
+				// the middle of the range, which a handful would miss.
+				numbers = allNumbersToTry(config, audits)
+			}
+			argSets := argSetsToTry(config)
+
+			// The program does not depend on nr, so it is assembled once.
+			vm, err := bpf.NewVM(prog)
+			if err != nil {
+				t.Fatalf("NewVM: %v", err)
+			}
+
+			cases := 0
+			for _, audit := range audits {
+				for _, nr := range numbers {
+					for _, args := range argSets {
+						want, err := modelAction(config, audit, nr, args)
+						if err != nil {
+							t.Fatalf("modelAction: %v", err)
+						}
+						got, err := vm.Run(seccompDataImage(nr, audit, args[:]...))
+						if err != nil {
+							t.Fatalf("Run(nr=%d arch=%#x args=%v): %v", nr, audit, args, err)
+						}
+						if uint32(got) != want {
+							t.Errorf("nr=%d arch=%#x args=%v: filter said %#x, model says %#x", nr, audit, args, uint32(got), want)
+						}
+						cases++
+					}
+				}
+			}
+			t.Logf("%d cases over %d architectures", cases, len(audits))
+		})
+	}
+}
+
+// auditArchesToTry returns the architectures to feed the filter: the native one,
+// any the profile adds, and one it does not mention, so the bad-architecture
+// path is covered.
+func auditArchesToTry(t *testing.T, config *configs.Seccomp) []uint32 {
+	t.Helper()
+	short, err := shortNativeArch()
+	if err != nil {
+		t.Fatal(err)
+	}
+	names := append([]string{short}, shortArchList(config.Architectures)...)
+
+	seen := map[uint32]bool{}
+	var out []uint32
+	for _, name := range names {
+		scmp, ok := scmpArchForShort(name)
+		if !ok {
+			t.Fatalf("unknown architecture %q", name)
+		}
+		a := auditArch[scmp]
+		if seen[a] {
+			continue
+		}
+		seen[a] = true
+		out = append(out, a)
+	}
+	// One that nothing covers.
+	for _, a := range []uint32{unix.AUDIT_ARCH_I386, unix.AUDIT_ARCH_X86_64, unix.AUDIT_ARCH_ARM} {
+		if !seen[a] {
+			out = append(out, a)
+			break
+		}
+	}
+	return out
+}
+
+// syscallNumbersToTry collects the numbers worth feeding to the filter: those
+// the profile mentions, either side of the largest one (where the -ENOSYS stub
+// changes behaviour), and a couple of unrelated ones.
+func syscallNumbersToTry(config *configs.Seccomp, audits []uint32) []uint32 {
+	seen := map[uint32]bool{}
+	var out []uint32
+	add := func(nr uint32) {
+		if !seen[nr] {
+			seen[nr] = true
+			out = append(out, nr)
+		}
+	}
+	var max uint32
+	for _, rule := range config.Syscalls {
+		if rule == nil {
+			continue
+		}
+		for _, audit := range audits {
+			table := modelArchTable(config, audit)
+			if table == nil {
+				continue
+			}
+			num, ok := table[rule.Name]
+			if !ok {
+				continue
+			}
+			add(num)
+			if num > max {
+				max = num
+			}
+		}
+	}
+	add(0)
+	add(1)
+	add(4200)
+	if max > 0 {
+		add(max - 1)
+		add(max + 1)
+		add(max + 100)
+	}
+	return out
+}
+
+// allNumbersToTry returns every syscall number from 0 to two past the largest
+// one any table the filter will be handed lists, which is where the -ENOSYS stub
+// stops answering. Walking the whole range is what makes a widened jump whose
+// branch is reversed visible, and it is cheap for a program that is assembled
+// once.
+func allNumbersToTry(config *configs.Seccomp, audits []uint32) []uint32 {
+	var max uint32
+	for _, audit := range audits {
+		table := modelArchTable(config, audit)
+		if table == nil {
+			continue
+		}
+		for _, nr := range table {
+			if nr > max {
+				max = nr
+			}
+		}
+	}
+	out := make([]uint32, 0, max+3)
+	for nr := uint32(0); nr <= max+2; nr++ {
+		out = append(out, nr)
+	}
+	return out
+}
+
+// argSetsToTry builds a small grid of argument values, biased towards the values
+// the profile's conditions mention.
+func argSetsToTry(config *configs.Seccomp) [][seccompDataArgCount]uint64 {
+	values := map[uint64]bool{0: true, 1: true, ^uint64(0): true}
+	for _, rule := range config.Syscalls {
+		if rule == nil {
+			continue
+		}
+		for _, arg := range rule.Args {
+			if arg == nil {
+				continue
+			}
+			values[arg.Value] = true
+			values[arg.ValueTwo] = true
+			values[arg.Value+1] = true
+			values[arg.Value-1] = true
+		}
+	}
+	// A few values over the 32-bit boundary, because only the low half is
+	// compared.
+	values[1<<32] = true
+	values[(1<<32)|42] = true
+
+	sorted := make([]uint64, 0, len(values))
+	for v := range values {
+		sorted = append(sorted, v)
+	}
+	// Deterministic order.
+	for i := 0; i < len(sorted); i++ {
+		for j := i + 1; j < len(sorted); j++ {
+			if sorted[j] < sorted[i] {
+				sorted[i], sorted[j] = sorted[j], sorted[i]
+			}
+		}
+	}
+
+	var out [][seccompDataArgCount]uint64
+	for _, v := range sorted {
+		var set [seccompDataArgCount]uint64
+		set[0] = v
+		out = append(out, set)
+	}
+	// Second-argument variations, for rules that look at arg 1.
+	for _, v := range sorted {
+		var set [seccompDataArgCount]uint64
+		set[1] = v
+		out = append(out, set)
+	}
+	// And both together.
+	for _, v := range sorted {
+		var set [seccompDataArgCount]uint64
+		set[0] = v
+		set[1] = v
+		out = append(out, set)
+	}
+	return out
+}
+
+// validateProgram checks the properties the kernel's verifier checks for a
+// classic BPF program: every jump lands inside the program, and no reachable
+// path runs off the end. The jumps in the architecture dispatch and the -ENOSYS
+// stub are computed by hand, and the binary-search rewrite adds many more.
+func validateProgram(t *testing.T, prog []bpf.Instruction) {
+	t.Helper()
+	if len(prog) == 0 {
+		t.Fatal("program is empty")
+	}
+
+	for i, ins := range prog {
+		check := func(skip int) {
+			if target := i + 1 + skip; target >= len(prog) {
+				t.Errorf("instruction %d (%v): jump to %d is outside the program (%d instructions)", i, ins, target, len(prog))
+			} else if target < 0 {
+				t.Errorf("instruction %d (%v): jump to %d is before the program", i, ins, target)
+			}
+		}
+		switch v := ins.(type) {
+		case bpf.JumpIf:
+			check(int(v.SkipTrue))
+			check(int(v.SkipFalse))
+		case bpf.Jump:
+			check(int(v.Skip))
+		}
+	}
+
+	// Walk everything reachable from the entry point and make sure no path
+	// falls off the end.
+	seen := make([]bool, len(prog))
+	stack := []int{0}
+	for len(stack) > 0 {
+		i := stack[len(stack)-1]
+		stack = stack[:len(stack)-1]
+		if i < 0 || i >= len(prog) {
+			t.Errorf("control reaches instruction %d, outside the program", i)
+			continue
+		}
+		if seen[i] {
+			continue
+		}
+		seen[i] = true
+
+		var next []int
+		switch v := prog[i].(type) {
+		case bpf.RetConstant, bpf.RetA:
+			// Terminates.
+			continue
+		case bpf.RawInstruction:
+			if v.Op&0x07 == 0x06 { // BPF_RET
+				continue
+			}
+			next = []int{i + 1}
+		case bpf.Jump:
+			next = []int{i + 1 + int(v.Skip)}
+		case bpf.JumpIf:
+			next = []int{i + 1 + int(v.SkipTrue), i + 1 + int(v.SkipFalse)}
+		default:
+			next = []int{i + 1}
+		}
+		for _, n := range next {
+			if n == len(prog) {
+				t.Errorf("instruction %d (%v) falls off the end of the program", i, prog[i])
+				continue
+			}
+			stack = append(stack, n)
+		}
+	}
+}
+
+// longestPath returns the number of instructions on the longest path from the
+// first instruction to a return. Every jump in a compiled section is forward, so
+// the paths form a DAG and one reverse pass suffices.
+func longestPath(prog []bpf.Instruction) int {
+	best := make([]int, len(prog))
+	for i := len(prog) - 1; i >= 0; i-- {
+		var succ []int
+		switch v := prog[i].(type) {
+		case bpf.RetConstant, bpf.RetA:
+			best[i] = 1
+			continue
+		case bpf.Jump:
+			succ = []int{i + 1 + int(v.Skip)}
+		case bpf.JumpIf:
+			succ = []int{i + 1 + int(v.SkipTrue), i + 1 + int(v.SkipFalse)}
+		default:
+			succ = []int{i + 1}
+		}
+		longest := 0
+		for _, s := range succ {
+			if s < len(prog) && best[s] > longest {
+				longest = best[s]
+			}
+		}
+		best[i] = 1 + longest
+	}
+	return best[0]
+}
+
+// TestSectionIsATree checks that the rules are laid out as a search tree rather
+// than walked one by one: the number of instructions a syscall passes through has
+// to grow with log(rules), not with rules. A chain is still correct, so nothing
+// else here would notice if the tree were lost.
+func TestSectionIsATree(t *testing.T) {
+	short, err := shortNativeArch()
+	if err != nil {
+		t.Fatal(err)
+	}
+	table := syscallNumbers[archs0(short)]
+	config := &configs.Seccomp{DefaultAction: configs.Errno}
+	for name := range table {
+		config.Syscalls = append(config.Syscalls, &configs.Syscall{Name: name, Action: configs.Allow})
+	}
+	rules := len(config.Syscalls)
+
+	section, err := compileArchSection(config, table, retErrnoEnosys)
+	if err != nil {
+		t.Fatalf("compileArchSection: %v", err)
+	}
+	validateProgram(t, section)
+
+	depth := longestPath(section)
+	budget := 6*int(math.Ceil(math.Log2(float64(rules)))) + 24
+	t.Logf("%d rules: %d instructions, longest path %d (budget %d)", rules, len(section), depth, budget)
+
+	if depth > budget {
+		t.Errorf("longest path is %d instructions, over the %d a tree should need: the rules look like a chain", depth, budget)
+	}
+	// A chain would be about three instructions per rule.
+	if len(section) > 4*rules {
+		t.Errorf("%d instructions for %d rules, larger than a search tree should need", len(section), rules)
+	}
+}
+
+// TestProgramsWellFormed runs the structural checks over every profile,
+// including ones large enough to push the hand-computed jumps around.
+func TestProgramsWellFormed(t *testing.T) {
+	profiles := modelProfiles(t)
+
+	// A profile with every syscall this architecture knows, which is the
+	// largest program the architecture dispatch and the stub will ever see, and
+	// which also gives the stub the largest number of architectures to compare.
+	short, err := shortNativeArch()
+	if err != nil {
+		t.Fatal(err)
+	}
+	table := syscallNumbers[archs0(short)]
+	big := &configs.Seccomp{DefaultAction: configs.Errno}
+	for name := range table {
+		big.Syscalls = append(big.Syscalls, &configs.Syscall{Name: name, Action: configs.Allow})
+	}
+	profiles["every-syscall"] = big
+
+	for name, config := range profiles {
+		t.Run(name, func(t *testing.T) {
+			prog, err := compileFilter(config)
+			if err != nil {
+				t.Fatalf("compileFilter: %v", err)
+			}
+			validateProgram(t, prog)
+			if len(prog) > maxBPFInsns {
+				t.Errorf("compiled to %d instructions, over the kernel limit of %d", len(prog), maxBPFInsns)
+			}
+		})
+	}
+}
+
+// archs0 is a typo guard: it returns the SCMP_ARCH_* name for a short name.
+func archs0(short string) string {
+	for scmp, s := range archs {
+		if s == short {
+			return scmp
+		}
+	}
+	return short
+}
+
+// TestEndiannessOfArgumentOffsets pins the offset the compiler reads an argument
+// from. The other tests cannot catch a mistake here, because the helper that
+// builds their seccomp_data images calls the same function the compiler does, so
+// both would be wrong together. The expectation is derived from the standard
+// library rather than from argLowOffset.
+func TestEndiannessOfArgumentOffsets(t *testing.T) {
+	var probe [2]byte
+	binary.NativeEndian.PutUint16(probe[:], 0x0102)
+	littleEndian := probe[0] == 0x02
+
+	for index := 0; index < seccompDataArgCount; index++ {
+		want := uint32(16 + 8*index)
+		if !littleEndian {
+			// On a big-endian host the low half of the argument comes second.
+			want += 4
+		}
+		config := &configs.Seccomp{
+			DefaultAction: configs.Errno,
+			Syscalls: []*configs.Syscall{{
+				Name:   "read",
+				Action: configs.Allow,
+				Args:   []*configs.Arg{{Index: uint(index), Op: configs.EqualTo, Value: 1}},
+			}},
+		}
+		prog, err := compileFilter(config)
+		if err != nil {
+			t.Fatalf("compileFilter: %v", err)
+		}
+		var found bool
+		for _, ins := range prog {
+			if load, ok := ins.(bpf.LoadAbsolute); ok && load.Off == want {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Errorf("argument %d: no load from offset %d in the compiled program", index, want)
+		}
+	}
+}
+
+// TestMaskedEqualOperandOrderShape checks the emitted instructions, not just the
+// behaviour, because the behaviour tests were written with the operands the same
+// way round as the compiler was.
+func TestMaskedEqualOperandOrderShape(t *testing.T) {
+	const (
+		mask  = 0xff00
+		value = 0x1200
+	)
+	config := &configs.Seccomp{
+		DefaultAction: configs.Errno,
+		Syscalls: []*configs.Syscall{{
+			Name:   "read",
+			Action: configs.Allow,
+			Args:   []*configs.Arg{{Index: 0, Op: configs.MaskEqualTo, Value: mask, ValueTwo: value}},
+		}},
+	}
+	prog, err := compileFilter(config)
+	if err != nil {
+		t.Fatalf("compileFilter: %v", err)
+	}
+
+	var anded, compared bool
+	for _, ins := range prog {
+		switch v := ins.(type) {
+		case bpf.ALUOpConstant:
+			if v.Op == bpf.ALUOpAnd && v.Val == mask {
+				anded = true
+			}
+		case bpf.JumpIf:
+			if v.Val == value {
+				compared = true
+			}
+			if v.Val == mask {
+				t.Error("a jump compares against the mask; the value to compare against comes second in SCMP_CMP_MASKED_EQ")
+			}
+		}
+	}
+	if !anded {
+		t.Errorf("nothing masks the argument with %#x", mask)
+	}
+	if !compared {
+		t.Errorf("nothing compares the masked argument against %#x", value)
+	}
+}
+
+// TestEnosysStubOverlapCases drives generateEnosysStub directly, because the
+// branches for architectures sharing an AUDIT_ARCH value (x86_64 and x32) and
+// for s390's setup(2) multiplexing cannot be reached through a profile: x/sys
+// has no x32 table, so no real profile produces them.
+func TestEnosysStubOverlapCases(t *testing.T) {
+	// One instruction the stub can jump into. Everything that reaches the
+	// filter is allowed, so the test only has to distinguish ENOSYS from ALLOW.
+	filter := []bpf.Instruction{bpf.RetConstant{Val: retAllow}}
+
+	run := func(t *testing.T, stub []bpf.Instruction, nr uint32) uint32 {
+		t.Helper()
+		prog := append(append([]bpf.Instruction{}, stub...), filter...)
+		validateProgram(t, prog)
+		vm, err := bpf.NewVM(prog)
+		if err != nil {
+			t.Fatalf("NewVM: %v", err)
+		}
+		got, err := vm.Run(seccompDataImage(nr, unix.AUDIT_ARCH_X86_64))
+		if err != nil {
+			t.Fatalf("Run: %v", err)
+		}
+		return uint32(got)
+	}
+
+	t.Run("x86_64 and x32 share an AUDIT_ARCH", func(t *testing.T) {
+		const (
+			x86Max = 100
+			x32Min = 0x40000000 // the x32 ABI sets bit 30
+			x32Max = x32Min | 200
+		)
+		stub, err := generateEnosysStub(lastSyscallMap{
+			unix.AUDIT_ARCH_X86_64: {
+				"SCMP_ARCH_X86_64": x86Max,
+				"SCMP_ARCH_X32":    x32Max,
+			},
+		})
+		if err != nil {
+			t.Fatalf("generateEnosysStub: %v", err)
+		}
+
+		// Below the x86_64 maximum: into the filter.
+		if got := run(t, stub, 50); got != retAllow {
+			t.Errorf("x86_64 nr 50: got %#x, want allow", got)
+		}
+		// Above it: ENOSYS.
+		if got := run(t, stub, x86Max+1); got != retErrnoEnosys {
+			t.Errorf("x86_64 nr %d: got %#x, want ENOSYS", x86Max+1, got)
+		}
+		// An x32 syscall below the x32 maximum is not judged by the x86_64
+		// maximum, which is the whole point of the overlap case.
+		if got := run(t, stub, x32Min|50); got != retAllow {
+			t.Errorf("x32 nr %#x: got %#x, want allow", x32Min|50, got)
+		}
+		if got := run(t, stub, x32Max+1); got != retErrnoEnosys {
+			t.Errorf("x32 nr %#x: got %#x, want ENOSYS", x32Max+1, got)
+		}
+	})
+
+	t.Run("s390 setup multiplexing", func(t *testing.T) {
+		stub, err := generateEnosysStub(lastSyscallMap{
+			unix.AUDIT_ARCH_S390X: {"SCMP_ARCH_S390X": 100},
+		})
+		if err != nil {
+			t.Fatalf("generateEnosysStub: %v", err)
+		}
+		prog := append(append([]bpf.Instruction{}, stub...), filter...)
+		validateProgram(t, prog)
+		vm, err := bpf.NewVM(prog)
+		if err != nil {
+			t.Fatalf("NewVM: %v", err)
+		}
+
+		// setup(2) is syscall 0, and a syscall the kernel does not know is
+		// left as 0 by the multiplexing scheme, so 0 must come back ENOSYS.
+		got, err := vm.Run(seccompDataImage(0, unix.AUDIT_ARCH_S390X))
+		if err != nil {
+			t.Fatalf("Run: %v", err)
+		}
+		if uint32(got) != retErrnoEnosys {
+			t.Errorf("s390x nr 0: got %#x, want ENOSYS", uint32(got))
+		}
+		// And a number below the maximum still reaches the filter.
+		got, err = vm.Run(seccompDataImage(50, unix.AUDIT_ARCH_S390X))
+		if err != nil {
+			t.Fatalf("Run: %v", err)
+		}
+		if uint32(got) != retAllow {
+			t.Errorf("s390x nr 50: got %#x, want allow", uint32(got))
+		}
+	})
+}
+
+// TestCompileErrors covers the profiles that must be rejected rather than
+// compiled into something surprising.
+func TestCompileErrors(t *testing.T) {
+	tests := []struct {
+		name   string
+		config *configs.Seccomp
+	}{
+		{"nil config", nil},
+		{"nil syscall", &configs.Seccomp{
+			DefaultAction: configs.Errno,
+			Syscalls:      []*configs.Syscall{nil},
+		}},
+		{"empty syscall name", &configs.Seccomp{
+			DefaultAction: configs.Errno,
+			Syscalls:      []*configs.Syscall{{Name: "", Action: configs.Allow}},
+		}},
+		{"invalid operator", &configs.Seccomp{
+			DefaultAction: configs.Errno,
+			Syscalls: []*configs.Syscall{{
+				Name:   "read",
+				Action: configs.Allow,
+				Args:   []*configs.Arg{{Index: 0, Op: configs.Operator(99), Value: 1}},
+			}},
+		}},
+		{"argument index out of range", &configs.Seccomp{
+			DefaultAction: configs.Errno,
+			Syscalls: []*configs.Syscall{{
+				Name:   "read",
+				Action: configs.Allow,
+				Args:   []*configs.Arg{{Index: 6, Op: configs.EqualTo, Value: 1}},
+			}},
+		}},
+		{"nil argument", &configs.Seccomp{
+			DefaultAction: configs.Errno,
+			Syscalls: []*configs.Syscall{{
+				Name:   "read",
+				Action: configs.Allow,
+				Args:   []*configs.Arg{nil},
+			}},
+		}},
+		{"notify on write", &configs.Seccomp{
+			DefaultAction: configs.Errno,
+			Syscalls:      []*configs.Syscall{{Name: "write", Action: configs.Notify}},
+		}},
+		{"notify as the default action", &configs.Seccomp{
+			DefaultAction: configs.Notify,
+		}},
+		{"unknown architecture", &configs.Seccomp{
+			DefaultAction: configs.Errno,
+			Architectures: []string{"SCMP_ARCH_PDP11"},
+		}},
+		{"unknown action", &configs.Seccomp{
+			DefaultAction: configs.Action(99),
+		}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := compileFilter(tc.config); err == nil {
+				t.Error("compileFilter accepted it, want an error")
+			} else {
+				t.Logf("rejected: %v", err)
+			}
+		})
+	}
+}
+
+// TestSyscallTableSanity checks the generated tables against numbers that can be
+// read off the kernel headers, so that a broken generator cannot quietly produce
+// a table that is merely self-consistent.
+func TestSyscallTableSanity(t *testing.T) {
+	// Name -> number, for a few syscalls whose numbering is stable and known.
+	known := map[string]map[string]uint32{
+		"SCMP_ARCH_X86_64":  {"read": 0, "write": 1, "open": 2, "close": 3, "clone": 56, "fork": 57, "openat": 257, "clone3": 435},
+		"SCMP_ARCH_X86":     {"read": 3, "write": 4, "open": 5, "close": 6, "clone": 120, "fork": 2},
+		"SCMP_ARCH_AARCH64": {"read": 63, "write": 64, "close": 57, "clone": 220, "openat": 56},
+		"SCMP_ARCH_S390X":   {"read": 3, "write": 4, "close": 6, "clone": 120},
+	}
+	for arch, want := range known {
+		table, ok := syscallNumbers[arch]
+		if !ok {
+			t.Errorf("%s: no table generated", arch)
+			continue
+		}
+		for name, nr := range want {
+			if got, ok := table[name]; !ok {
+				t.Errorf("%s: no number for %q", arch, name)
+			} else if got != nr {
+				t.Errorf("%s: %q is %d, want %d", arch, name, got, nr)
+			}
+		}
+	}
+
+	// Every generated table should be sane: names lower-cased, numbers inside
+	// the range the kernel uses.
+	for arch, table := range syscallNumbers {
+		if len(table) < 100 {
+			t.Errorf("%s: only %d syscalls", arch, len(table))
+		}
+		for name, nr := range table {
+			if name == "" || name != lowerASCII(name) {
+				t.Errorf("%s: %q is not a lower-case syscall name", arch, name)
+			}
+			if nr > 0xffff {
+				t.Errorf("%s: %q is %d, outside the syscall number range", arch, name, nr)
+			}
+		}
+	}
+
+	if runtime.GOARCH == "amd64" {
+		if !binaryIsLittleEndian() {
+			t.Error("amd64 is not little-endian, which would be surprising")
+		}
+	}
+}
+
+func lowerASCII(s string) string {
+	out := []byte(s)
+	for i, c := range out {
+		if c >= 'A' && c <= 'Z' {
+			out[i] = c + ('a' - 'A')
+		}
+	}
+	return string(out)
+}
+
+func binaryIsLittleEndian() bool {
+	var probe [2]byte
+	binary.NativeEndian.PutUint16(probe[:], 0x0102)
+	return probe[0] == 0x02
+}
