@@ -110,6 +110,65 @@ var auditArch = map[string]uint32{
 	"SCMP_ARCH_LOONGARCH64": unix.AUDIT_ARCH_LOONGARCH64,
 }
 
+// archIs32Bit reports whether an architecture compares only the low 32 bits of
+// a syscall argument, which is what libseccomp does when its arch definition
+// has ARCH_SIZE_32. It cannot be read off the AUDIT_ARCH value: x32 shares
+// x86_64's value and is 32-bit, and the two mips n32 ABIs set the 64-bit bit
+// in their own. An architecture not listed is 64-bit.
+var archIs32Bit = map[string]bool{
+	"SCMP_ARCH_X86":         true,
+	"SCMP_ARCH_X32":         true,
+	"SCMP_ARCH_ARM":         true,
+	"SCMP_ARCH_MIPS":        true,
+	"SCMP_ARCH_MIPS64N32":   true,
+	"SCMP_ARCH_MIPSEL":      true,
+	"SCMP_ARCH_MIPSEL64N32": true,
+	"SCMP_ARCH_PPC":         true,
+	"SCMP_ARCH_S390":        true,
+}
+
+// archLittleEndian reports an architecture's byte order. libseccomp refuses to
+// add an architecture whose byte order differs from the native one -- its filter
+// cannot compare seccomp_data in both orders, so db_col_db_add() returns EDOM --
+// and the cgo-free build refuses the same ones. An architecture not listed is
+// treated as the native byte order and is never refused.
+var archLittleEndian = map[string]bool{
+	"SCMP_ARCH_X86":         true,
+	"SCMP_ARCH_X86_64":      true,
+	"SCMP_ARCH_X32":         true,
+	"SCMP_ARCH_ARM":         true,
+	"SCMP_ARCH_AARCH64":     true,
+	"SCMP_ARCH_LOONGARCH64": true,
+	"SCMP_ARCH_MIPS":        false,
+	"SCMP_ARCH_MIPS64":      false,
+	"SCMP_ARCH_MIPS64N32":   false,
+	"SCMP_ARCH_MIPSEL":      true,
+	"SCMP_ARCH_MIPSEL64":    true,
+	"SCMP_ARCH_MIPSEL64N32": true,
+	"SCMP_ARCH_PPC":         false,
+	"SCMP_ARCH_PPC64":       false,
+	"SCMP_ARCH_PPC64LE":     true,
+	"SCMP_ARCH_RISCV64":     true,
+	"SCMP_ARCH_S390":        false,
+	"SCMP_ARCH_S390X":       false,
+}
+
+// archSyscallTables returns an architecture's syscall name -> number table and
+// its multiplexor table. libseccomp's generated tables (libseccomp_linux.go) are
+// authoritative wherever they exist, so the two builds resolve the same names;
+// the kernel-header table (syscalls_linux.go) is the fallback for an
+// architecture the libseccomp these were generated from has no table for -- on
+// libseccomp 2.5.5 that is loongarch64 only.
+func archSyscallTables(arch string) (map[string]uint32, map[string]pseudoSyscall, bool) {
+	if table, ok := libseccompSyscalls[arch]; ok {
+		return table, libseccompPseudo[arch], true
+	}
+	if table, ok := syscallNumbers[arch]; ok {
+		return table, nil, true
+	}
+	return nil, nil, false
+}
+
 // seccompRetAction converts a libcontainer action into the SECCOMP_RET_* value
 // to return.
 func seccompRetAction(action configs.Action, errnoRet *uint) (uint32, error) {
@@ -157,7 +216,10 @@ func nativeSeccompArch() (string, error) {
 // archSection is one architecture's worth of compiled rules.
 type archSection struct {
 	auditArch uint32
-	prog      []bpf.Instruction
+	// arch is the SCMP_ARCH_* name, which is how the x32/x86_64 pair sharing
+	// one AUDIT_ARCH value is told apart at dispatch time.
+	arch string
+	prog []bpf.Instruction
 }
 
 // normalizeArch turns an architecture name from a profile into the SCMP_ARCH_*
@@ -203,39 +265,49 @@ func compileFilter(config *configs.Seccomp) ([]bpf.Instruction, error) {
 	arches := append([]string{native}, config.Architectures...)
 
 	sections := make([]archSection, 0, len(arches))
-	seen := make(map[uint32]bool, len(arches))
+	seen := make(map[string]bool, len(arches))
 
 	for _, name := range arches {
 		arch, ok := normalizeArch(name)
 		if !ok {
 			return nil, fmt.Errorf("unknown seccomp architecture %q", name)
 		}
-		audit := auditArch[arch]
-		// Two architectures can share one AUDIT_ARCH value (x32 and x86_64);
-		// the first match wins, as in libseccomp.
-		if seen[audit] {
+		// Each architecture token is added once; listing the native one again
+		// is a no-op, as it is in libseccomp.
+		if seen[arch] {
 			continue
 		}
-		seen[audit] = true
+		seen[arch] = true
 
-		table, ok := syscallNumbers[arch]
+		// libseccomp refuses (EDOM) to add an architecture whose byte order
+		// differs from the native one, and the cgo build turns that into a
+		// failed install. Refusing the same architectures keeps the two builds
+		// equivalent: an extra section the kernel can never match is not the
+		// same filter if one build installs it and the other does not.
+		if little, ok := archLittleEndian[arch]; ok && little != !isBigEndian {
+			return nil, fmt.Errorf("error adding architecture to seccomp filter: %w", unix.EDOM)
+		}
+
+		table, pseudo, ok := archSyscallTables(arch)
 		if !ok {
-			// x/sys/unix carries no table for this architecture (x32, the
-			// mips n32 ABIs, 31-bit s390). Leaving it out of the dispatch
-			// means the filter's bad-architecture action refuses it, which
-			// is fail-closed and better than filtering it with the wrong
+			// No name table for this architecture. Leaving it out of the
+			// dispatch means the filter's bad-architecture action refuses it,
+			// which is fail-closed and better than filtering it with the wrong
 			// numbering.
 			logrus.Warnf("seccomp: no syscall table for architecture %q, refusing it rather than filtering it", name)
 			continue
 		}
-		prog, err := compileArchSection(config, table, defaultRet, audit)
+		prog, err := compileArchSection(config, table, pseudo, defaultRet, arch)
 		if err != nil {
 			return nil, err
 		}
-		sections = append(sections, archSection{auditArch: audit, prog: prog})
+		sections = append(sections, archSection{auditArch: auditArch[arch], arch: arch, prog: prog})
 	}
 
-	prog := assembleFilter(sections, defaultRet)
+	prog, err := assembleFilter(sections)
+	if err != nil {
+		return nil, err
+	}
 
 	// The stub goes in front, so that a syscall the profile knows nothing about
 	// is answered with ENOSYS rather than the default action.
@@ -252,49 +324,81 @@ func compileFilter(config *configs.Seccomp) ([]bpf.Instruction, error) {
 // assembleFilter lays out the architecture dispatch followed by each
 // architecture's section.
 //
-//	ld  [4]
-//	jeq A0 -> 0,1 ; jmp section0
-//	jeq A1 -> 0,1 ; jmp section1
+//	ld  [4]                 ; seccomp_data.arch
+//	jeq A0 -> arch0
+//	jeq A1 -> arch1
 //	...
-//	ret KILL_PROCESS   ; the arch matched nothing
-//	section0:
+//	ret KILL_THREAD         ; the arch matched nothing
+//	arch0:
 //	  ...
-//	section1:
+//	arch1:
 //	  ...
-func assembleFilter(sections []archSection, defaultRet uint32) []bpf.Instruction {
-	// The jmp targets are 32-bit, so the architecture tests can reach a
-	// section of any size; only the jeq's own skip has to stay small, and it
-	// is always 1.
-	header := 1 + 2*len(sections) + 1
-	starts := make([]int, len(sections))
-	offset := header
-	for i, s := range sections {
-		starts[i] = offset
-		offset += len(s.prog)
+//
+// Two architectures can share one AUDIT_ARCH value: x32 and x86_64 both report
+// AUDIT_ARCH_X86_64, and bit 30 of the syscall number is the only signal that
+// tells them apart. That pair is dispatched by testing the bit.
+func assembleFilter(sections []archSection) ([]bpf.Instruction, error) {
+	type group struct {
+		audit uint32
+		secs  []archSection
+	}
+	var groups []group
+	index := map[uint32]int{}
+	for _, s := range sections {
+		at, ok := index[s.auditArch]
+		if !ok {
+			index[s.auditArch] = len(groups)
+			groups = append(groups, group{audit: s.auditArch, secs: []archSection{s}})
+			continue
+		}
+		groups[at].secs = append(groups[at].secs, s)
 	}
 
-	prog := make([]bpf.Instruction, 0, offset)
-	prog = append(prog, bpf.LoadAbsolute{Off: seccompDataArch, Size: 4})
-	for i, s := range sections {
-		prog = append(prog, bpf.JumpIf{
-			Cond:      bpf.JumpEqual,
-			Val:       s.auditArch,
-			SkipTrue:  0,
-			SkipFalse: 1,
-		})
-		// This instruction is at index 2*i+2, so it is followed by index
-		// 2*i+3; skip from there to the section.
-		prog = append(prog, bpf.Jump{Skip: uint32(starts[i] - (2*i + 3))})
+	b := &builder{}
+	b.emit(bpf.LoadAbsolute{Off: seccompDataArch, Size: 4})
+	for i, g := range groups {
+		b.jumpIf(bpf.JumpEqual, g.audit, fmt.Sprintf("arch%d", i))
 	}
 	// Reached only when the architecture is none of the above. libseccomp
 	// returns SECCOMP_RET_KILL_THREAD here, not KILL_PROCESS, and matching it
 	// matters: a thread killed by KILL_THREAD leaves the rest of a threaded
 	// process running, which is not the same filter.
-	prog = append(prog, bpf.RetConstant{Val: retKillThread})
-	for _, s := range sections {
-		prog = append(prog, s.prog...)
+	b.emit(bpf.RetConstant{Val: retKillThread})
+
+	for i, g := range groups {
+		b.label(fmt.Sprintf("arch%d", i))
+		if len(g.secs) == 1 {
+			b.emit(g.secs[0].prog...)
+			continue
+		}
+
+		var x32, x64 *archSection
+		for j := range g.secs {
+			if g.secs[j].arch == "SCMP_ARCH_X32" {
+				x32 = &g.secs[j]
+			} else {
+				x64 = &g.secs[j]
+			}
+		}
+		if x32 == nil || x64 == nil {
+			return nil, fmt.Errorf("seccomp: architectures share audit value %#x but are not the x86_64/x32 pair", g.audit)
+		}
+		// seccomp_data.arch is AUDIT_ARCH_X86_64 for both ABIs; bit 30 of the
+		// syscall number is what says which one this is.
+		b.emit(bpf.LoadAbsolute{Off: seccompDataNr, Size: 4})
+		b.jumpIf(bpf.JumpBitsSet, x32SyscallBit, fmt.Sprintf("arch%d_x32", i))
+		b.jumpTo(fmt.Sprintf("arch%d_x64", i))
+		b.label(fmt.Sprintf("arch%d_x32", i))
+		b.emit(x32.prog...)
+		b.label(fmt.Sprintf("arch%d_x64", i))
+		b.emit(x64.prog...)
 	}
-	return prog
+
+	prog, err := b.assemble()
+	if err != nil {
+		return nil, fmt.Errorf("assembling seccomp filter: %w", err)
+	}
+	return prog, nil
 }
 
 // A classic BPF conditional jump only reaches 255 instructions ahead, and a
@@ -451,9 +555,10 @@ func (b *builder) assemble() ([]bpf.Instruction, error) {
 }
 
 // preparedRule is a rule that survived validation, with its action already
-// turned into a SECCOMP_RET_* value.
+// turned into a SECCOMP_RET_* value and its argument conditions detached from
+// the profile, because a multiplexed rule is emitted with rewritten arguments.
 type preparedRule struct {
-	call   *configs.Syscall
+	args   []*configs.Arg
 	action uint32
 }
 
@@ -471,6 +576,9 @@ type ruleGroup struct {
 type treeEmitter struct {
 	b    *builder
 	next int
+	// word32 is set for a 32-bit architecture, whose arguments have no high
+	// word and are compared the way libseccomp compares them (see archIs32Bit).
+	word32 bool
 }
 
 func (t *treeEmitter) newLabel(prefix string) string {
@@ -525,7 +633,7 @@ func (t *treeEmitter) emitGroup(g ruleGroup, defaultLabel string) {
 // emitRule emits one rule: its argument conditions, all of which must hold, and
 // then its action. Control jumps to failLabel as soon as one does not.
 func (t *treeEmitter) emitRule(r preparedRule, failLabel string) {
-	for _, arg := range r.call.Args {
+	for _, arg := range r.args {
 		t.emitCondition(arg, failLabel)
 	}
 	t.b.emit(bpf.RetConstant{Val: r.action})
@@ -544,10 +652,12 @@ func argWordOffset(index uint, high bool) uint32 {
 // emitCondition emits the tests for one argument, jumping to failLabel when the
 // condition does not hold and carrying on when it does.
 //
-// Every condition compares the whole 64-bit argument, which is what libseccomp
-// does and what the profile means. cBPF reads one word at a time, so that means
-// comparing the high half first. Comparing only the low half would match
-// 0x10000002a against a rule for 42; for an allow rule that is fail-open.
+// On a 64-bit architecture the whole 64-bit argument is compared, which is what
+// libseccomp does and what the profile means: comparing only the low half would
+// match 0x10000002a against a rule for 42, and for an allow rule that is
+// fail-open. On a 32-bit architecture there is no high half to compare, and
+// libseccomp compares only the low word, so this does too; cBPF reads one word
+// at a time, so a 64-bit comparison means comparing the high half first.
 func (t *treeEmitter) emitCondition(arg *configs.Arg, failLabel string) {
 	loadHigh := func() {
 		t.b.emit(bpf.LoadAbsolute{Off: argWordOffset(arg.Index, true), Size: 4})
@@ -561,52 +671,64 @@ func (t *treeEmitter) emitCondition(arg *configs.Arg, failLabel string) {
 
 	switch arg.Op {
 	case configs.EqualTo:
-		loadHigh()
-		t.b.jumpIf(bpf.JumpNotEqual, high, failLabel)
+		if !t.word32 {
+			loadHigh()
+			t.b.jumpIf(bpf.JumpNotEqual, high, failLabel)
+		}
 		loadLow()
 		t.b.jumpIf(bpf.JumpNotEqual, low, failLabel)
 
 	case configs.NotEqualTo:
 		// Only fails when both halves are equal.
 		cont := t.newLabel("cont")
-		loadHigh()
-		t.b.jumpIf(bpf.JumpNotEqual, high, cont)
+		if !t.word32 {
+			loadHigh()
+			t.b.jumpIf(bpf.JumpNotEqual, high, cont)
+		}
 		loadLow()
 		t.b.jumpIf(bpf.JumpEqual, low, failLabel)
 		t.b.label(cont)
 
 	case configs.GreaterThan: // arg > value
 		cont := t.newLabel("cont")
-		loadHigh()
-		t.b.jumpIf(bpf.JumpLessThan, high, failLabel)
-		t.b.jumpIf(bpf.JumpGreaterThan, high, cont)
+		if !t.word32 {
+			loadHigh()
+			t.b.jumpIf(bpf.JumpLessThan, high, failLabel)
+			t.b.jumpIf(bpf.JumpGreaterThan, high, cont)
+		}
 		loadLow()
 		t.b.jumpIf(bpf.JumpLessOrEqual, low, failLabel)
 		t.b.label(cont)
 
 	case configs.GreaterThanOrEqualTo: // arg >= value
 		cont := t.newLabel("cont")
-		loadHigh()
-		t.b.jumpIf(bpf.JumpLessThan, high, failLabel)
-		t.b.jumpIf(bpf.JumpGreaterThan, high, cont)
+		if !t.word32 {
+			loadHigh()
+			t.b.jumpIf(bpf.JumpLessThan, high, failLabel)
+			t.b.jumpIf(bpf.JumpGreaterThan, high, cont)
+		}
 		loadLow()
 		t.b.jumpIf(bpf.JumpLessThan, low, failLabel)
 		t.b.label(cont)
 
 	case configs.LessThan: // arg < value
 		cont := t.newLabel("cont")
-		loadHigh()
-		t.b.jumpIf(bpf.JumpGreaterThan, high, failLabel)
-		t.b.jumpIf(bpf.JumpLessThan, high, cont)
+		if !t.word32 {
+			loadHigh()
+			t.b.jumpIf(bpf.JumpGreaterThan, high, failLabel)
+			t.b.jumpIf(bpf.JumpLessThan, high, cont)
+		}
 		loadLow()
 		t.b.jumpIf(bpf.JumpGreaterOrEqual, low, failLabel)
 		t.b.label(cont)
 
 	case configs.LessThanOrEqualTo: // arg <= value
 		cont := t.newLabel("cont")
-		loadHigh()
-		t.b.jumpIf(bpf.JumpGreaterThan, high, failLabel)
-		t.b.jumpIf(bpf.JumpLessThan, high, cont)
+		if !t.word32 {
+			loadHigh()
+			t.b.jumpIf(bpf.JumpGreaterThan, high, failLabel)
+			t.b.jumpIf(bpf.JumpLessThan, high, cont)
+		}
 		loadLow()
 		t.b.jumpIf(bpf.JumpGreaterThan, low, failLabel)
 		t.b.label(cont)
@@ -617,13 +739,31 @@ func (t *treeEmitter) emitCondition(arg *configs.Arg, failLabel string) {
 		// rule match nothing, which matters because the default profile allows
 		// clone with (arg0 & CLONE_NEW*) == 0 -- that zero is the value being
 		// compared against, not an unset field.
-		loadHigh()
-		t.b.emit(bpf.ALUOpConstant{Op: bpf.ALUOpAnd, Val: uint32(arg.Value >> 32)})
-		t.b.jumpIf(bpf.JumpNotEqual, uint32(arg.ValueTwo>>32), failLabel)
+		if !t.word32 {
+			loadHigh()
+			t.b.emit(bpf.ALUOpConstant{Op: bpf.ALUOpAnd, Val: uint32(arg.Value >> 32)})
+			t.b.jumpIf(bpf.JumpNotEqual, uint32(arg.ValueTwo>>32), failLabel)
+		}
 		loadLow()
 		t.b.emit(bpf.ALUOpConstant{Op: bpf.ALUOpAnd, Val: low})
 		t.b.jumpIf(bpf.JumpNotEqual, uint32(arg.ValueTwo), failLabel)
 	}
+}
+
+// pseudoRuleArgs returns the argument conditions for the multiplexed half of a
+// socketcall/ipc rule. libseccomp forces argument 0 to the subcall number and
+// keeps whatever other argument conditions the rule carried, so a condition
+// the profile put on argument 0 is replaced rather than kept.
+func pseudoRuleArgs(subcall uint32, args []*configs.Arg) []*configs.Arg {
+	out := make([]*configs.Arg, 0, len(args)+1)
+	out = append(out, &configs.Arg{Index: 0, Op: configs.EqualTo, Value: uint64(subcall)})
+	for _, arg := range args {
+		if arg.Index == 0 {
+			continue
+		}
+		out = append(out, arg)
+	}
+	return out
 }
 
 // validateArgs rejects an argument list the compiler cannot express.
@@ -647,13 +787,37 @@ func validateArgs(call *configs.Syscall) error {
 	return nil
 }
 
+// hasDuplicateArgIndex reports whether two conditions in one rule name the same
+// argument index. runc's cgo path treats that as its cue to split the rule.
+func hasDuplicateArgIndex(args []*configs.Arg) bool {
+	var seen [seccompDataArgCount]bool
+	for _, arg := range args {
+		if seen[arg.Index] {
+			return true
+		}
+		seen[arg.Index] = true
+	}
+	return false
+}
+
 // compileArchSection compiles the rules for one architecture, ending in the
-// default action.
-func compileArchSection(config *configs.Seccomp, table map[string]uint32, defaultRet uint32, auditArch uint32) ([]bpf.Instruction, error) {
+// default action. table is the architecture's syscall name -> number map, as
+// libseccomp resolves names, and pseudo its multiplexor table (nil when the
+// architecture has no multiplexor).
+func compileArchSection(config *configs.Seccomp, table map[string]uint32, pseudo map[string]pseudoSyscall, defaultRet uint32, arch string) ([]bpf.Instruction, error) {
 	// Grouped by syscall number so the tree can be ordered; the rules within a
 	// group keep profile order.
 	index := make(map[uint32]int)
 	var groups []ruleGroup
+
+	addRule := func(num uint32, rule preparedRule) {
+		if at, seen := index[num]; seen {
+			groups[at].rules = append(groups[at].rules, rule)
+			return
+		}
+		index[num] = len(groups)
+		groups = append(groups, ruleGroup{num: num, rules: []preparedRule{rule}})
+	}
 
 	for _, call := range config.Syscalls {
 		if call == nil {
@@ -670,50 +834,80 @@ func compileArchSection(config *configs.Seccomp, table map[string]uint32, defaul
 		if err != nil {
 			return nil, fmt.Errorf("action in seccomp profile is invalid: %w", err)
 		}
-		if action == defaultRet && len(call.Args) == 0 {
-			// Same result as the default action, so the rule cannot change the
-			// outcome. The whole action is compared, not just its kind: two
-			// SCMP_ACT_ERRNO rules returning different errnos differ.
+		if action == defaultRet {
+			// libseccomp's matchCall drops a rule whose action equals the
+			// profile's default action regardless of its arguments: the default
+			// already says what the rule says, so the rule cannot change the
+			// outcome, and keeping it lets it shadow a later, stricter rule for
+			// the same syscall. The whole action is compared, not just its kind:
+			// two SCMP_ACT_ERRNO rules returning different errnos differ.
+			//
+			// This is the same check the libseccomp build makes, so the two
+			// builds agree on which of two rules for one syscall survives.
 			continue
 		}
 		if err := validateArgs(call); err != nil {
 			return nil, err
 		}
 
-		num, ok := table[call.Name]
-		if !ok {
-			// Not every name in a profile exists on every architecture, and
-			// libseccomp resolves names against its own tables. Skipping is
-			// what the cgo build does too.
+		ps, isPseudo := pseudo[call.Name]
+		num, inTable := table[call.Name]
+		if !isPseudo && !inTable {
+			// libseccomp cannot resolve the name on this architecture, or
+			// resolves it to a pseudo number it adds no rule for, so the cgo
+			// build drops the rule. Dropping it here is what keeps the two
+			// filters the same; the table is generated from libseccomp so that
+			// "cannot resolve" means the same on both sides.
 			logrus.Debugf("unknown seccomp syscall %q on this architecture, ignored", call.Name)
 			continue
 		}
 
-		rule := preparedRule{call: call, action: action}
-		if at, seen := index[num]; seen {
-			groups[at].rules = append(groups[at].rules, rule)
-			continue
+		// runc's cgo path turns two conditions on one argument into separate
+		// rules rather than one rule carrying both, because libseccomp's
+		// db_col_rule_add() rejects a second condition on an argument index it
+		// has already seen (EINVAL); matchCall therefore gives each condition
+		// its own AddRuleConditional. That is OR, not AND, and it is what the
+		// kernel actually sees from the cgo build, so it is what this has to
+		// compile.
+		conditions := [][]*configs.Arg{call.Args}
+		if hasDuplicateArgIndex(call.Args) {
+			conditions = make([][]*configs.Arg, 0, len(call.Args))
+			for _, arg := range call.Args {
+				conditions = append(conditions, []*configs.Arg{arg})
+			}
 		}
-		index[num] = len(groups)
-		groups = append(groups, ruleGroup{num: num, rules: []preparedRule{rule}})
+
+		for _, conds := range conditions {
+			if isPseudo {
+				// The multiplexed rule, with argument 0 forced to the subcall,
+				// and, when the architecture has a direct-wired number for the
+				// name, a second rule on it. Both are needed: old kernels have
+				// only the multiplexor and newer ones accept both.
+				addRule(ps.mux, preparedRule{args: pseudoRuleArgs(ps.subcall, conds), action: action})
+				if ps.flat != 0 {
+					addRule(ps.flat, preparedRule{args: conds, action: action})
+				}
+				continue
+			}
+			addRule(num, preparedRule{args: conds, action: action})
+		}
 	}
 
 	sort.Slice(groups, func(i, j int) bool { return groups[i].num < groups[j].num })
 
 	const defaultLabel = "default"
 	b := &builder{}
-	t := &treeEmitter{b: b}
+	t := &treeEmitter{b: b, word32: archIs32Bit[arch]}
 	b.emit(bpf.LoadAbsolute{Off: seccompDataNr, Size: 4})
 
-	// On x86_64 only, an x32 syscall has to be recognised by bit 30 of the
-	// number, because seccomp_data.arch does not distinguish the two ABIs.
-	// There is no x32 syscall table here, so x32 numbers are refused rather
-	// than judged with the x86-64 table. libseccomp does the same when a
-	// profile does not list SCMP_ARCH_X32; when one does, it filters them
-	// through its x32 table, which this build cannot do, so it refuses those
-	// too. 0xffffffff is not a syscall and takes the ordinary path, as it does
-	// in libseccomp.
-	if auditArch == unix.AUDIT_ARCH_X86_64 {
+	// On the x86_64 ABI, an x32 syscall signals itself with bit 30 of the
+	// number, because seccomp_data.arch is AUDIT_ARCH_X86_64 for both ABIs.
+	// When the profile lists SCMP_ARCH_X32 there is a section for it and
+	// assembleFilter dispatches by the bit, so this section only ever sees
+	// x86-64 numbers. When it does not, an x32 syscall is refused here rather
+	// than judged with the x86-64 table. 0xffffffff is not a syscall and takes
+	// the ordinary path, as it does in libseccomp.
+	if arch == "SCMP_ARCH_X86_64" {
 		kill, tree := t.newLabel("x32kill"), t.newLabel("tree")
 		b.jumpIf(bpf.JumpLessThan, x32SyscallBit, tree)
 		b.jumpIf(bpf.JumpNotEqual, ^uint32(0), kill)

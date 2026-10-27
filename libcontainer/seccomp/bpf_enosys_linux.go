@@ -94,13 +94,10 @@ func findLastSyscalls(config *configs.Seccomp) (lastSyscallMap, error) {
 	last := make(lastSyscallMap)
 	for arch := range arches {
 		audit := auditArch[arch]
-		table, ok := syscallNumbers[arch]
+		table, _, ok := archSyscallTables(arch)
 		if !ok {
-			// x/sys/unix carries no table for x32 (or for 31-bit s390).
-			// Such an architecture gets no -ENOSYS check, which means its
-			// syscalls fall through to the filter and take its default
-			// action. That is fail-closed, and x32 is rare enough to leave
-			// for now; the cgo build handles it through libseccomp.
+			// No name table at all for this architecture, so there is no
+			// "past the end of the table" to detect and no stub for it.
 			logrus.Debugf("seccomp: no syscall table for %v, skipping its -ENOSYS check", arch)
 			continue
 		}
@@ -112,8 +109,10 @@ func findLastSyscalls(config *configs.Seccomp) (lastSyscallMap, error) {
 			}
 			num, ok := table[rule.Name]
 			if !ok {
-				// A name this architecture does not have is ignored, as
-				// elsewhere.
+				// A name this architecture does not resolve, or one libseccomp
+				// resolves to a pseudo number it adds no rule for, is ignored
+				// here, exactly as it is in the cgo build's findLastSyscalls:
+				// the pseudo number is negative and cannot raise a maximum.
 				continue
 			}
 			if num > max {
