@@ -19,16 +19,13 @@ import (
 // in Go (bpf_linux.go) instead of being handed to libseccomp, and installed
 // with seccomp(2).
 //
-// Two behaviours of the libseccomp build are not reproduced here yet:
-//
-//   - The -ENOSYS stub. runc prepends a stub to the filter libseccomp
-//     generates so that syscalls the profile knows nothing about return ENOSYS
-//     rather than the default action, which is what lets libc fall back from
-//     newer syscalls (clone3) to older ones (clone). Without it those syscalls
-//     get the default action instead. See patchbpf for the cgo version.
-//
-//   - libseccomp's binary search tree. The compiled filter here is a linear
-//     chain, so a syscall walks the rules one by one.
+// Both behaviours of the libseccomp build are reproduced. The -ENOSYS stub that
+// runc prepends -- so that syscalls the profile knows nothing about return
+// ENOSYS rather than the default action, which is what lets libc fall back from
+// newer syscalls (clone3) to older ones (clone) -- is in bpf_enosys_linux.go.
+// And the rules are a balanced binary search over the syscall number rather than
+// a linear chain, so a syscall costs O(log rules) comparisons. The numbers come
+// from internal/mksyscalls rather than being maintained by hand.
 
 // InitSeccomp installs the seccomp filters to be used in the container as
 // specified in config.

@@ -35,6 +35,12 @@ import (
 // chain is used first because every jump in it is short, which keeps the
 // encoder simple, whereas a tree needs long jumps through 32-bit unconditonals.
 
+// x32SyscallBit marks an x32 syscall. x32 is an ILP32 ABI on x86-64, signalled
+// per syscall rather than per process: seccomp_data.arch is AUDIT_ARCH_X86_64
+// for both ABIs, so bit 30 of the syscall number is the only way to tell them
+// apart.
+const x32SyscallBit = 1 << 30
+
 // Offsets into struct seccomp_data (linux/seccomp.h).
 const (
 	seccompDataNr       = 0
@@ -55,9 +61,9 @@ var isBigEndian = func() bool {
 }()
 
 // argLowOffset is the offset of the low 32 bits of an argument within its
-// 8-byte slot, and argHighOffset the offset of the high 32 bits.
-//
-// Only the low half is compared; a 64-bit argument needs both.
+// 8-byte slot, and argHighOffset the offset of the high 32 bits. A 64-bit
+// argument is compared as two words; a 32-bit architecture has only the low
+// one meaningful.
 func argLowOffset() uint32 {
 	if isBigEndian {
 		return 4
@@ -222,7 +228,7 @@ func compileFilter(config *configs.Seccomp) ([]bpf.Instruction, error) {
 			logrus.Warnf("seccomp: no syscall table for architecture %q, refusing it rather than filtering it", name)
 			continue
 		}
-		prog, err := compileArchSection(config, table, defaultRet)
+		prog, err := compileArchSection(config, table, defaultRet, audit)
 		if err != nil {
 			return nil, err
 		}
@@ -280,9 +286,11 @@ func assembleFilter(sections []archSection, defaultRet uint32) []bpf.Instruction
 		// 2*i+3; skip from there to the section.
 		prog = append(prog, bpf.Jump{Skip: uint32(starts[i] - (2*i + 3))})
 	}
-	// Reached only when the architecture is none of the above: refusing to
-	// run is the safe answer, and matches libseccomp.
-	prog = append(prog, bpf.RetConstant{Val: retKillProcess})
+	// Reached only when the architecture is none of the above. libseccomp
+	// returns SECCOMP_RET_KILL_THREAD here, not KILL_PROCESS, and matching it
+	// matters: a thread killed by KILL_THREAD leaves the rest of a threaded
+	// process running, which is not the same filter.
+	prog = append(prog, bpf.RetConstant{Val: retKillThread})
 	for _, s := range sections {
 		prog = append(prog, s.prog...)
 	}
@@ -442,11 +450,18 @@ func (b *builder) assemble() ([]bpf.Instruction, error) {
 	return nil, errors.New("seccomp: jump layout did not settle")
 }
 
+// preparedRule is a rule that survived validation, with its action already
+// turned into a SECCOMP_RET_* value.
+type preparedRule struct {
+	call   *configs.Syscall
+	action uint32
+}
+
 // ruleGroup is every rule a profile gives for one syscall, in profile order: the
 // first whose argument conditions hold decides.
 type ruleGroup struct {
-	num    uint32
-	bodies [][]bpf.Instruction
+	num   uint32
+	rules []preparedRule
 }
 
 // treeEmitter lays rules out as a balanced binary search over the syscall
@@ -456,6 +471,11 @@ type ruleGroup struct {
 type treeEmitter struct {
 	b    *builder
 	next int
+}
+
+func (t *treeEmitter) newLabel(prefix string) string {
+	t.next++
+	return fmt.Sprintf("%s%d", prefix, t.next)
 }
 
 func (t *treeEmitter) emit(groups []ruleGroup, defaultLabel string) {
@@ -469,17 +489,17 @@ func (t *treeEmitter) emit(groups []ruleGroup, defaultLabel string) {
 	}
 
 	mid := len(groups) / 2
-	right := fmt.Sprintf("right%d", t.next)
-	t.next++
+	right := t.newLabel("right")
 
-	// A holds the syscall number here and nothing has clobbered it: a leaf body
-	// is only reached once the descent is over, and it never returns to the
-	// tree.
+	// The accumulator still holds the syscall number here: the descent compares
+	// it against each pivot, and the argument loads that overwrite it happen only
+	// inside a rule body, which is reached once the descent is over and never
+	// returns to the tree.
 	//
-	// JumpGreaterOrEqual compares A against the value, i.e. "nr >= pivot", which
-	// is the direction the kernel implements. x/net/bpf's doc comments describe
-	// these the other way round; the arg operator code above follows the
-	// encoding too, which is why it is right.
+	// JumpGreaterOrEqual compares the accumulator against the value, i.e.
+	// "nr >= pivot", which is the direction the kernel implements. x/net/bpf's
+	// doc comments describe these the other way round, which is worth knowing
+	// when reading the conditions below.
 	t.b.jumpIf(bpf.JumpGreaterOrEqual, groups[mid].num, right)
 	t.emit(groups[:mid], defaultLabel)
 	t.b.label(right)
@@ -487,23 +507,150 @@ func (t *treeEmitter) emit(groups []ruleGroup, defaultLabel string) {
 }
 
 func (t *treeEmitter) emitGroup(g ruleGroup, defaultLabel string) {
+	// The descent lands on the nearest key, not necessarily an equal one.
 	t.b.jumpIf(bpf.JumpNotEqual, g.num, defaultLabel)
-	for _, body := range g.bodies {
-		t.b.emit(body...)
+	for i, r := range g.rules {
+		fail := defaultLabel
+		if i+1 < len(g.rules) {
+			// Another rule for the same syscall gets a chance.
+			fail = t.newLabel("next")
+		}
+		t.emitRule(r, fail)
+		if fail != defaultLabel {
+			t.b.label(fail)
+		}
 	}
-	// A body with argument conditions falls through to here when they do not
-	// hold, so the default action has to be reached from here. A bare action
-	// always returns, so the jump would be unreachable code -- and there is one
-	// of these per rule in the common case where no rule has conditions.
-	if last := g.bodies[len(g.bodies)-1]; len(last) > 1 {
-		t.b.jumpTo(defaultLabel)
+}
+
+// emitRule emits one rule: its argument conditions, all of which must hold, and
+// then its action. Control jumps to failLabel as soon as one does not.
+func (t *treeEmitter) emitRule(r preparedRule, failLabel string) {
+	for _, arg := range r.call.Args {
+		t.emitCondition(arg, failLabel)
 	}
+	t.b.emit(bpf.RetConstant{Val: r.action})
+}
+
+// argWordOffset is the offset in struct seccomp_data of the low or high 32 bits
+// of a syscall argument.
+func argWordOffset(index uint, high bool) uint32 {
+	off := uint32(seccompDataArgs + seccompDataArgSize*index)
+	if high {
+		return off + argHighOffset()
+	}
+	return off + argLowOffset()
+}
+
+// emitCondition emits the tests for one argument, jumping to failLabel when the
+// condition does not hold and carrying on when it does.
+//
+// Every condition compares the whole 64-bit argument, which is what libseccomp
+// does and what the profile means. cBPF reads one word at a time, so that means
+// comparing the high half first. Comparing only the low half would match
+// 0x10000002a against a rule for 42; for an allow rule that is fail-open.
+func (t *treeEmitter) emitCondition(arg *configs.Arg, failLabel string) {
+	loadHigh := func() {
+		t.b.emit(bpf.LoadAbsolute{Off: argWordOffset(arg.Index, true), Size: 4})
+	}
+	loadLow := func() {
+		t.b.emit(bpf.LoadAbsolute{Off: argWordOffset(arg.Index, false), Size: 4})
+	}
+
+	high := uint32(arg.Value >> 32)
+	low := uint32(arg.Value)
+
+	switch arg.Op {
+	case configs.EqualTo:
+		loadHigh()
+		t.b.jumpIf(bpf.JumpNotEqual, high, failLabel)
+		loadLow()
+		t.b.jumpIf(bpf.JumpNotEqual, low, failLabel)
+
+	case configs.NotEqualTo:
+		// Only fails when both halves are equal.
+		cont := t.newLabel("cont")
+		loadHigh()
+		t.b.jumpIf(bpf.JumpNotEqual, high, cont)
+		loadLow()
+		t.b.jumpIf(bpf.JumpEqual, low, failLabel)
+		t.b.label(cont)
+
+	case configs.GreaterThan: // arg > value
+		cont := t.newLabel("cont")
+		loadHigh()
+		t.b.jumpIf(bpf.JumpLessThan, high, failLabel)
+		t.b.jumpIf(bpf.JumpGreaterThan, high, cont)
+		loadLow()
+		t.b.jumpIf(bpf.JumpLessOrEqual, low, failLabel)
+		t.b.label(cont)
+
+	case configs.GreaterThanOrEqualTo: // arg >= value
+		cont := t.newLabel("cont")
+		loadHigh()
+		t.b.jumpIf(bpf.JumpLessThan, high, failLabel)
+		t.b.jumpIf(bpf.JumpGreaterThan, high, cont)
+		loadLow()
+		t.b.jumpIf(bpf.JumpLessThan, low, failLabel)
+		t.b.label(cont)
+
+	case configs.LessThan: // arg < value
+		cont := t.newLabel("cont")
+		loadHigh()
+		t.b.jumpIf(bpf.JumpGreaterThan, high, failLabel)
+		t.b.jumpIf(bpf.JumpLessThan, high, cont)
+		loadLow()
+		t.b.jumpIf(bpf.JumpGreaterOrEqual, low, failLabel)
+		t.b.label(cont)
+
+	case configs.LessThanOrEqualTo: // arg <= value
+		cont := t.newLabel("cont")
+		loadHigh()
+		t.b.jumpIf(bpf.JumpGreaterThan, high, failLabel)
+		t.b.jumpIf(bpf.JumpLessThan, high, cont)
+		loadLow()
+		t.b.jumpIf(bpf.JumpGreaterThan, low, failLabel)
+		t.b.label(cont)
+
+	case configs.MaskEqualTo:
+		// SCMP_CMP_MASKED_EQ takes the mask first and the value to compare
+		// against second: (arg & Value) == ValueTwo. Swapping the two makes the
+		// rule match nothing, which matters because the default profile allows
+		// clone with (arg0 & CLONE_NEW*) == 0 -- that zero is the value being
+		// compared against, not an unset field.
+		loadHigh()
+		t.b.emit(bpf.ALUOpConstant{Op: bpf.ALUOpAnd, Val: uint32(arg.Value >> 32)})
+		t.b.jumpIf(bpf.JumpNotEqual, uint32(arg.ValueTwo>>32), failLabel)
+		loadLow()
+		t.b.emit(bpf.ALUOpConstant{Op: bpf.ALUOpAnd, Val: low})
+		t.b.jumpIf(bpf.JumpNotEqual, uint32(arg.ValueTwo), failLabel)
+	}
+}
+
+// validateArgs rejects an argument list the compiler cannot express.
+func validateArgs(call *configs.Syscall) error {
+	for _, arg := range call.Args {
+		if arg == nil {
+			return fmt.Errorf("nil argument in seccomp rule for %s", call.Name)
+		}
+		if arg.Index >= seccompDataArgCount {
+			return fmt.Errorf("seccomp rule for %s: argument index %d out of range", call.Name, arg.Index)
+		}
+		switch arg.Op {
+		case configs.EqualTo, configs.NotEqualTo,
+			configs.GreaterThan, configs.GreaterThanOrEqualTo,
+			configs.LessThan, configs.LessThanOrEqualTo,
+			configs.MaskEqualTo:
+		default:
+			return fmt.Errorf("invalid operator %d in seccomp rule for %s", arg.Op, call.Name)
+		}
+	}
+	return nil
 }
 
 // compileArchSection compiles the rules for one architecture, ending in the
 // default action.
-func compileArchSection(config *configs.Seccomp, table map[string]uint32, defaultRet uint32) ([]bpf.Instruction, error) {
-	// Grouped by syscall number so the tree can be ordered; the bodies within a
+func compileArchSection(config *configs.Seccomp, table map[string]uint32, defaultRet uint32, auditArch uint32) ([]bpf.Instruction, error) {
+	// Grouped by syscall number so the tree can be ordered; the rules within a
 	// group keep profile order.
 	index := make(map[uint32]int)
 	var groups []ruleGroup
@@ -519,18 +666,18 @@ func compileArchSection(config *configs.Seccomp, table map[string]uint32, defaul
 			return nil, errors.New("SCMP_ACT_NOTIFY cannot be used for the write syscall")
 		}
 
-		body, err := compileRule(call, defaultRet)
+		action, err := seccompRetAction(call.Action, call.ErrnoRet)
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("action in seccomp profile is invalid: %w", err)
 		}
-		if len(body) == 0 {
-			// Redundant rule (same action as the default, no conditions).
+		if action == defaultRet && len(call.Args) == 0 {
+			// Same result as the default action, so the rule cannot change the
+			// outcome. The whole action is compared, not just its kind: two
+			// SCMP_ACT_ERRNO rules returning different errnos differ.
 			continue
 		}
-		if len(body) > 0xff {
-			// The failing argument tests inside a body skip to its end with an
-			// 8-bit offset.
-			return nil, fmt.Errorf("seccomp rule for %s is too long (%d instructions)", call.Name, len(body))
+		if err := validateArgs(call); err != nil {
+			return nil, err
 		}
 
 		num, ok := table[call.Name]
@@ -542,108 +689,42 @@ func compileArchSection(config *configs.Seccomp, table map[string]uint32, defaul
 			continue
 		}
 
+		rule := preparedRule{call: call, action: action}
 		if at, seen := index[num]; seen {
-			groups[at].bodies = append(groups[at].bodies, body)
+			groups[at].rules = append(groups[at].rules, rule)
 			continue
 		}
 		index[num] = len(groups)
-		groups = append(groups, ruleGroup{num: num, bodies: [][]bpf.Instruction{body}})
+		groups = append(groups, ruleGroup{num: num, rules: []preparedRule{rule}})
 	}
 
 	sort.Slice(groups, func(i, j int) bool { return groups[i].num < groups[j].num })
 
 	const defaultLabel = "default"
 	b := &builder{}
+	t := &treeEmitter{b: b}
 	b.emit(bpf.LoadAbsolute{Off: seccompDataNr, Size: 4})
-	(&treeEmitter{b: b}).emit(groups, defaultLabel)
+
+	// On x86_64 only, an x32 syscall has to be recognised by bit 30 of the
+	// number, because seccomp_data.arch does not distinguish the two ABIs.
+	// There is no x32 syscall table here, so x32 numbers are refused rather
+	// than judged with the x86-64 table. libseccomp does the same when a
+	// profile does not list SCMP_ARCH_X32; when one does, it filters them
+	// through its x32 table, which this build cannot do, so it refuses those
+	// too. 0xffffffff is not a syscall and takes the ordinary path, as it does
+	// in libseccomp.
+	if auditArch == unix.AUDIT_ARCH_X86_64 {
+		kill, tree := t.newLabel("x32kill"), t.newLabel("tree")
+		b.jumpIf(bpf.JumpLessThan, x32SyscallBit, tree)
+		b.jumpIf(bpf.JumpNotEqual, ^uint32(0), kill)
+		b.jumpTo(tree)
+		b.label(kill)
+		b.emit(bpf.RetConstant{Val: retKillThread})
+		b.label(tree)
+	}
+
+	t.emit(groups, defaultLabel)
 	b.label(defaultLabel)
 	b.emit(bpf.RetConstant{Val: defaultRet})
 	return b.assemble()
-}
-
-// compileRule builds the body for one syscall: the argument tests (all of
-// which must hold) followed by the action. It returns nothing when the rule
-// is redundant, so that the caller can drop it.
-func compileRule(call *configs.Syscall, defaultRet uint32) ([]bpf.Instruction, error) {
-	action, err := seccompRetAction(call.Action, call.ErrnoRet)
-	if err != nil {
-		return nil, fmt.Errorf("action in seccomp profile is invalid: %w", err)
-	}
-	if action == defaultRet && len(call.Args) == 0 {
-		// Same result as the default action, so the rule can never change the
-		// outcome. This compares the whole action rather than just its kind:
-		// two SCMP_ACT_ERRNO rules returning different errnos are not the
-		// same rule.
-		return nil, nil
-	}
-	if len(call.Args) == 0 {
-		return []bpf.Instruction{bpf.RetConstant{Val: action}}, nil
-	}
-
-	body := []bpf.Instruction{}
-	// failAt records the conditional jumps that abandon the rule, so their
-	// skips can be filled in once the body length is known.
-	var failAt []int
-
-	for _, arg := range call.Args {
-		if arg == nil {
-			return nil, fmt.Errorf("nil argument in seccomp rule for %s", call.Name)
-		}
-		if arg.Index >= seccompDataArgCount {
-			return nil, fmt.Errorf("seccomp rule for %s: argument index %d out of range", call.Name, arg.Index)
-		}
-
-		// Only the low half is compared; the high half is not, and a
-		// 64-bit argument needs both.
-		body = append(body, bpf.LoadAbsolute{
-			Off:  uint32(seccompDataArgs+seccompDataArgSize*arg.Index) + argLowOffset(),
-			Size: 4,
-		})
-
-		// The condition below is the one that makes the rule *not* match;
-		// the rule is skipped when it is true. The comparison operators are
-		// expressed as A <op> K, which is what the cBPF jumps implement.
-		var (
-			fail   bpf.JumpTest
-			expect uint32
-		)
-		switch arg.Op {
-		case configs.EqualTo:
-			fail, expect = bpf.JumpNotEqual, uint32(arg.Value)
-		case configs.NotEqualTo:
-			fail, expect = bpf.JumpEqual, uint32(arg.Value)
-		case configs.GreaterThan:
-			fail, expect = bpf.JumpLessOrEqual, uint32(arg.Value)
-		case configs.GreaterThanOrEqualTo:
-			fail, expect = bpf.JumpLessThan, uint32(arg.Value)
-		case configs.LessThan:
-			fail, expect = bpf.JumpGreaterOrEqual, uint32(arg.Value)
-		case configs.LessThanOrEqualTo:
-			fail, expect = bpf.JumpGreaterThan, uint32(arg.Value)
-		case configs.MaskEqualTo:
-			// SCMP_CMP_MASKED_EQ takes the mask first and the value to
-			// compare against second: (arg & Value) == ValueTwo. Swapping
-			// the two makes the rule match nothing, which matters because
-			// the default profile allows clone with
-			// (arg0 & CLONE_NEW*) == 0 -- ValueTwo being zero there is not
-			// a mistake, it is the value being compared against.
-			body = append(body, bpf.ALUOpConstant{Op: bpf.ALUOpAnd, Val: uint32(arg.Value)})
-			fail, expect = bpf.JumpNotEqual, uint32(arg.ValueTwo)
-		default:
-			return nil, fmt.Errorf("invalid operator %d in seccomp rule for %s", arg.Op, call.Name)
-		}
-
-		failAt = append(failAt, len(body))
-		body = append(body, bpf.JumpIf{Cond: fail, Val: expect})
-	}
-
-	body = append(body, bpf.RetConstant{Val: action})
-	// Every failing test jumps past the action, i.e. to the end of the body.
-	for _, i := range failAt {
-		j := body[i].(bpf.JumpIf)
-		j.SkipTrue = uint8(len(body) - i - 1)
-		j.SkipFalse = 0
-		body[i] = j
-	}
-	return body, nil
 }

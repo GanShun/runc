@@ -302,8 +302,8 @@ func TestForeignArchKilled(t *testing.T) {
 		foreign = unix.AUDIT_ARCH_X86_64
 	}
 	ret := run(t, config, seccompDataImage(0, foreign))
-	if ret != int(retKillProcess) {
-		t.Errorf("foreign arch: got %#x, want KILL_PROCESS %#x", ret, int(retKillProcess))
+	if ret != int(retKillThread) {
+		t.Errorf("foreign arch: got %#x, want KILL_THREAD %#x", ret, int(retKillThread))
 	}
 }
 

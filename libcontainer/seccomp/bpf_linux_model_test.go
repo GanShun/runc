@@ -36,11 +36,20 @@ func modelAction(config *configs.Seccomp, audit uint32, nr uint32, args [seccomp
 		return 0, err
 	}
 
-	table := modelArchTable(config, audit)
+	arch, table := modelArchTable(config, audit)
 	if table == nil {
 		// No section covers this architecture, so the filter's
-		// bad-architecture action applies.
-		return retKillProcess, nil
+		// bad-architecture action applies: KILL_THREAD, as libseccomp does.
+		return retKillThread, nil
+	}
+
+	// An x32 syscall on x86_64 is refused: seccomp_data.arch cannot tell it
+	// from an x86-64 syscall and there is no x32 table here. libseccomp kills
+	// them when a profile does not list SCMP_ARCH_X32 and filters them through
+	// its x32 table when it does.
+	if audit == unix.AUDIT_ARCH_X86_64 && arch == "SCMP_ARCH_X86_64" &&
+		nr&x32SyscallBit != 0 && nr != ^uint32(0) {
+		return retKillThread, nil
 	}
 
 	// The -ENOSYS stub, when the profile is restrictive: a syscall number past
@@ -57,7 +66,11 @@ func modelAction(config *configs.Seccomp, audit uint32, nr uint32, args [seccomp
 				max = num
 			}
 		}
-		if max != 0 && nr > max {
+		// The stub skips its check when bit 30 is set: the x86_64 maximum says
+		// nothing about the (much larger) x32 numbers, so it has to. That
+		// includes 0xffffffff, which is how the kernel spells "no syscall".
+		x32Number := audit == unix.AUDIT_ARCH_X86_64 && arch == "SCMP_ARCH_X86_64" && nr&x32SyscallBit != 0
+		if max != 0 && !x32Number && nr > max {
 			return retErrnoEnosys, nil
 		}
 	}
@@ -215,16 +228,16 @@ func modelSyscallTable(scmp string) (map[string]uint32, bool) {
 // following the documented rule: the native architecture first, then the
 // profile's list, and the first architecture claiming an AUDIT_ARCH value wins.
 // Names are taken in the short spelling runc's config uses.
-func modelArchTable(config *configs.Seccomp, audit uint32) map[string]uint32 {
+func modelArchTable(config *configs.Seccomp, audit uint32) (string, map[string]uint32) {
 	short, err := shortNativeArch()
 	if err != nil {
-		return nil
+		return "", nil
 	}
 	seen := map[uint32]bool{}
 	for _, name := range append([]string{short}, shortArchList(config.Architectures)...) {
 		scmp, ok := scmpArchForShort(name)
 		if !ok {
-			return nil
+			return "", nil
 		}
 		a := auditArch[scmp]
 		if seen[a] {
@@ -238,10 +251,10 @@ func modelArchTable(config *configs.Seccomp, audit uint32) map[string]uint32 {
 			continue
 		}
 		if a == audit {
-			return table
+			return scmp, table
 		}
 	}
-	return nil
+	return "", nil
 }
 
 // modelStubApplies restates generatePatch's two conditions.
@@ -256,15 +269,16 @@ func modelStubApplies(config *configs.Seccomp) bool {
 	return true
 }
 
-// modelArgsMatch compares only the low 32 bits, as the kernel does.
+// modelArgsMatch compares the whole 64-bit argument, as libseccomp does and as
+// the compiler now does.
 func modelArgsMatch(args []*configs.Arg, values [seccompDataArgCount]uint64) bool {
 	for _, arg := range args {
 		if arg == nil || arg.Index >= seccompDataArgCount {
 			return false
 		}
-		got := uint32(values[arg.Index])
-		val := uint32(arg.Value)
-		valTwo := uint32(arg.ValueTwo)
+		got := values[arg.Index]
+		val := arg.Value
+		valTwo := arg.ValueTwo
 		var ok bool
 		switch arg.Op {
 		case configs.EqualTo:
@@ -615,7 +629,7 @@ func syscallNumbersToTry(config *configs.Seccomp, audits []uint32) []uint32 {
 			continue
 		}
 		for _, audit := range audits {
-			table := modelArchTable(config, audit)
+			_, table := modelArchTable(config, audit)
 			if table == nil {
 				continue
 			}
@@ -632,6 +646,14 @@ func syscallNumbersToTry(config *configs.Seccomp, audits []uint32) []uint32 {
 	add(0)
 	add(1)
 	add(4200)
+	// x32 syscall numbers set bit 30, and libseccomp singles them out on
+	// x86_64: a profile that does not list SCMP_ARCH_X32 rejects them rather
+	// than judging them by the x86_64 table. 0xffffffff is the "no syscall"
+	// value it also treats specially.
+	add(1 << 30)
+	add((1 << 30) | 1)
+	add((1 << 30) | 42)
+	add(^uint32(0))
 	if max > 0 {
 		add(max - 1)
 		add(max + 1)
@@ -648,7 +670,7 @@ func syscallNumbersToTry(config *configs.Seccomp, audits []uint32) []uint32 {
 func allNumbersToTry(config *configs.Seccomp, audits []uint32) []uint32 {
 	var max uint32
 	for _, audit := range audits {
-		table := modelArchTable(config, audit)
+		_, table := modelArchTable(config, audit)
 		if table == nil {
 			continue
 		}
@@ -838,7 +860,7 @@ func TestSectionIsATree(t *testing.T) {
 	}
 	rules := len(config.Syscalls)
 
-	section, err := compileArchSection(config, table, retErrnoEnosys)
+	section, err := compileArchSection(config, table, retErrnoEnosys, auditArch[archs0(short)])
 	if err != nil {
 		t.Fatalf("compileArchSection: %v", err)
 	}
