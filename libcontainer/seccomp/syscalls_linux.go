@@ -5564,22 +5564,3 @@ var syscallNumbers = map[string]map[string]uint32{
 		"writev":                  146,
 	},
 }
-
-// goarchToSeccompArch maps runtime.GOARCH to the seccomp architecture name used
-// by OCI seccomp profiles.
-var goarchToSeccompArch = map[string]string{
-	"386":      "SCMP_ARCH_X86",
-	"amd64":    "SCMP_ARCH_X86_64",
-	"arm":      "SCMP_ARCH_ARM",
-	"arm64":    "SCMP_ARCH_AARCH64",
-	"loong64":  "SCMP_ARCH_LOONGARCH64",
-	"mips":     "SCMP_ARCH_MIPS",
-	"mips64":   "SCMP_ARCH_MIPS64",
-	"mips64le": "SCMP_ARCH_MIPSEL64",
-	"mipsle":   "SCMP_ARCH_MIPSEL",
-	"ppc":      "SCMP_ARCH_PPC",
-	"ppc64":    "SCMP_ARCH_PPC64",
-	"ppc64le":  "SCMP_ARCH_PPC64LE",
-	"riscv64":  "SCMP_ARCH_RISCV64",
-	"s390x":    "SCMP_ARCH_S390X",
-}

@@ -37,32 +37,9 @@ import (
 	"strings"
 
 	libseccomp "github.com/seccomp/libseccomp-golang"
-)
 
-// archPairs maps the Go table's SCMP_ARCH_* key to libseccomp's ScmpArch.
-var archPairs = []struct {
-	goName string
-	scmp   libseccomp.ScmpArch
-}{
-	{"SCMP_ARCH_X86", libseccomp.ArchX86},
-	{"SCMP_ARCH_X86_64", libseccomp.ArchAMD64},
-	{"SCMP_ARCH_X32", libseccomp.ArchX32},
-	{"SCMP_ARCH_ARM", libseccomp.ArchARM},
-	{"SCMP_ARCH_AARCH64", libseccomp.ArchARM64},
-	{"SCMP_ARCH_LOONGARCH64", libseccomp.ArchLOONGARCH64},
-	{"SCMP_ARCH_MIPS", libseccomp.ArchMIPS},
-	{"SCMP_ARCH_MIPS64", libseccomp.ArchMIPS64},
-	{"SCMP_ARCH_MIPS64N32", libseccomp.ArchMIPS64N32},
-	{"SCMP_ARCH_MIPSEL", libseccomp.ArchMIPSEL},
-	{"SCMP_ARCH_MIPSEL64", libseccomp.ArchMIPSEL64},
-	{"SCMP_ARCH_MIPSEL64N32", libseccomp.ArchMIPSEL64N32},
-	{"SCMP_ARCH_PPC", libseccomp.ArchPPC},
-	{"SCMP_ARCH_PPC64", libseccomp.ArchPPC64},
-	{"SCMP_ARCH_PPC64LE", libseccomp.ArchPPC64LE},
-	{"SCMP_ARCH_RISCV64", libseccomp.ArchRISCV64},
-	{"SCMP_ARCH_S390", libseccomp.ArchS390},
-	{"SCMP_ARCH_S390X", libseccomp.ArchS390X},
-}
+	"github.com/opencontainers/runc/libcontainer/seccomp/internal/archmap"
+)
 
 var (
 	archRe  = regexp.MustCompile(`^\t"(SCMP_ARCH_[A-Z0-9_]+)": \{$`)
@@ -95,18 +72,18 @@ func main() {
 	ma, mi, mu := libseccomp.GetLibraryVersion()
 	fmt.Printf("libseccomp %d.%d.%d; Go tables from %s: %d architectures\n\n", ma, mi, mu, *tablesFile, len(goTables))
 
-	for _, p := range archPairs {
-		goTable, ok := goTables[p.goName]
+	for _, p := range archmap.Pairs {
+		goTable, ok := goTables[p.GoName]
 		if !ok {
-			fmt.Printf("== %-14s (libseccomp %v): NO GO TABLE\n\n", strings.TrimPrefix(p.goName, "SCMP_ARCH_"), p.scmp)
+			fmt.Printf("== %-14s (libseccomp %v): NO GO TABLE\n\n", strings.TrimPrefix(p.GoName, "SCMP_ARCH_"), p.Scmp)
 			continue
 		}
 
-		fmt.Printf("== %-14s (%d names)\n", strings.TrimPrefix(p.goName, "SCMP_ARCH_"), len(goTable))
+		fmt.Printf("== %-14s (%d names)\n", strings.TrimPrefix(p.GoName, "SCMP_ARCH_"), len(goTable))
 
 		oursOnly, numMismatch := []string{}, []string{}
 		for name, num := range goTable {
-			nr, err := libseccomp.GetSyscallFromNameByArch(name, p.scmp)
+			nr, err := libseccomp.GetSyscallFromNameByArch(name, p.Scmp)
 			if err != nil {
 				oursOnly = append(oursOnly, fmt.Sprintf("%s=%d", name, num))
 				continue
@@ -133,7 +110,7 @@ func main() {
 			if _, known := goTable[name]; known {
 				continue
 			}
-			if nr, err := libseccomp.GetSyscallFromNameByArch(name, p.scmp); err == nil {
+			if nr, err := libseccomp.GetSyscallFromNameByArch(name, p.Scmp); err == nil {
 				libOnly = append(libOnly, fmt.Sprintf("%s=%d", name, int32(nr)))
 			}
 		}

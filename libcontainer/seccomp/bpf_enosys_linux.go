@@ -93,7 +93,7 @@ func findLastSyscalls(config *configs.Seccomp) (lastSyscallMap, error) {
 
 	last := make(lastSyscallMap)
 	for arch := range arches {
-		audit := auditArch[arch]
+		audit := seccompArches[arch].audit
 		table, _, ok := archSyscallTables(arch)
 		if !ok {
 			// No name table at all for this architecture, so there is no

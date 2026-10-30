@@ -56,6 +56,8 @@ import (
 	"sort"
 
 	libseccomp "github.com/seccomp/libseccomp-golang"
+
+	"github.com/opencontainers/runc/libcontainer/seccomp/internal/archmap"
 )
 
 // PinnedLibseccompVersion is the libseccomp version the committed tables were
@@ -104,32 +106,6 @@ type Result struct {
 	Version string
 }
 
-// archPairs maps the generated table's SCMP_ARCH_* keys to libseccomp's own
-// architecture tokens.
-var archPairs = []struct {
-	goName string
-	scmp   libseccomp.ScmpArch
-}{
-	{"SCMP_ARCH_X86", libseccomp.ArchX86},
-	{"SCMP_ARCH_X86_64", libseccomp.ArchAMD64},
-	{"SCMP_ARCH_X32", libseccomp.ArchX32},
-	{"SCMP_ARCH_ARM", libseccomp.ArchARM},
-	{"SCMP_ARCH_AARCH64", libseccomp.ArchARM64},
-	{"SCMP_ARCH_LOONGARCH64", libseccomp.ArchLOONGARCH64},
-	{"SCMP_ARCH_MIPS", libseccomp.ArchMIPS},
-	{"SCMP_ARCH_MIPS64", libseccomp.ArchMIPS64},
-	{"SCMP_ARCH_MIPS64N32", libseccomp.ArchMIPS64N32},
-	{"SCMP_ARCH_MIPSEL", libseccomp.ArchMIPSEL},
-	{"SCMP_ARCH_MIPSEL64", libseccomp.ArchMIPSEL64},
-	{"SCMP_ARCH_MIPSEL64N32", libseccomp.ArchMIPSEL64N32},
-	{"SCMP_ARCH_PPC", libseccomp.ArchPPC},
-	{"SCMP_ARCH_PPC64", libseccomp.ArchPPC64},
-	{"SCMP_ARCH_PPC64LE", libseccomp.ArchPPC64LE},
-	{"SCMP_ARCH_RISCV64", libseccomp.ArchRISCV64},
-	{"SCMP_ARCH_S390", libseccomp.ArchS390},
-	{"SCMP_ARCH_S390X", libseccomp.ArchS390X},
-}
-
 // The pseudo-syscall ranges libseccomp uses, from its syscalls.c: a number in
 // the socket range is multiplexed through socketcall(2) with subcall = (-nr) %
 // 100, one in the ipc range through ipc(2) with subcall = (-nr) % 200.
@@ -175,13 +151,14 @@ func Generate(syscallsFile, expectedVersion string) (*Result, error) {
 	pseudo := map[string]map[string]pseudoEntry{}
 	var archNames []string
 
-	for _, p := range archPairs {
+	for _, p := range archmap.Pairs {
 		// An architecture this libseccomp does not know fails to resolve even
 		// "read"; skip it rather than emitting an empty table. (loongarch64 on
-		// libseccomp <= 2.5.5 is the case here; the compiler falls back to the
-		// kernel-header table for it.)
-		if _, err := libseccomp.GetSyscallFromNameByArch("read", p.scmp); err != nil {
-			fmt.Fprintf(os.Stderr, "mkseccomptables: skipping %s: %v\n", p.goName, err)
+		// libseccomp <= 2.5.5 is the case here; the compiler refuses it
+		// off-native, and uses the kernel-header table for it on a native
+		// loong64 build.)
+		if _, err := libseccomp.GetSyscallFromNameByArch("read", p.Scmp); err != nil {
+			fmt.Fprintf(os.Stderr, "mkseccomptables: skipping %s: %v\n", p.GoName, err)
 			continue
 		}
 
@@ -189,7 +166,7 @@ func Generate(syscallsFile, expectedVersion string) (*Result, error) {
 		flatByName := map[string]uint32{}
 		localCandidates := map[string]bool{}
 		for n := 0; n < numberScanLimit; n++ {
-			name, err := libseccomp.ScmpSyscall(n).GetNameByArch(p.scmp)
+			name, err := libseccomp.ScmpSyscall(n).GetNameByArch(p.Scmp)
 			if err != nil || name == "" {
 				continue
 			}
@@ -205,15 +182,15 @@ func Generate(syscallsFile, expectedVersion string) (*Result, error) {
 		// The multiplexing pseudo-syscall names, which have no direct number on
 		// architectures that spell them only as socketcall/ipc subcalls.
 		for n := -1; n >= -400; n-- {
-			name, err := libseccomp.ScmpSyscall(n).GetNameByArch(p.scmp)
+			name, err := libseccomp.ScmpSyscall(n).GetNameByArch(p.Scmp)
 			if err != nil || name == "" {
 				continue
 			}
 			localCandidates[name] = true
 		}
 
-		muxSocketcall := resolvePositive(p.scmp, "socketcall")
-		muxIPC := resolvePositive(p.scmp, "ipc")
+		muxSocketcall := resolvePositive(p.Scmp, "socketcall")
+		muxIPC := resolvePositive(p.Scmp, "ipc")
 
 		pos := map[string]uint32{}
 		pse := map[string]pseudoEntry{}
@@ -221,7 +198,7 @@ func Generate(syscallsFile, expectedVersion string) (*Result, error) {
 			localCandidates[name] = true
 		}
 		for name := range localCandidates {
-			nr, err := libseccomp.GetSyscallFromNameByArch(name, p.scmp)
+			nr, err := libseccomp.GetSyscallFromNameByArch(name, p.Scmp)
 			if err != nil {
 				continue
 			}
@@ -254,11 +231,11 @@ func Generate(syscallsFile, expectedVersion string) (*Result, error) {
 		if len(pos) == 0 {
 			continue
 		}
-		positive[p.goName] = pos
+		positive[p.GoName] = pos
 		if len(pse) > 0 {
-			pseudo[p.goName] = pse
+			pseudo[p.GoName] = pse
 		}
-		archNames = append(archNames, p.goName)
+		archNames = append(archNames, p.GoName)
 	}
 	sort.Strings(archNames)
 

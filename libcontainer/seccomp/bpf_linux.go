@@ -87,72 +87,6 @@ const (
 	retDataMask    = 0x0000ffff
 )
 
-// auditArch maps a seccomp architecture name (SCMP_ARCH_*) to the
-// AUDIT_ARCH_* value that appears in seccomp_data.arch.
-var auditArch = map[string]uint32{
-	"SCMP_ARCH_X86":         unix.AUDIT_ARCH_I386,
-	"SCMP_ARCH_X86_64":      unix.AUDIT_ARCH_X86_64,
-	"SCMP_ARCH_X32":         unix.AUDIT_ARCH_X86_64, // x32 shares the x86_64 arch value
-	"SCMP_ARCH_ARM":         unix.AUDIT_ARCH_ARM,
-	"SCMP_ARCH_AARCH64":     unix.AUDIT_ARCH_AARCH64,
-	"SCMP_ARCH_MIPS":        unix.AUDIT_ARCH_MIPS,
-	"SCMP_ARCH_MIPS64":      unix.AUDIT_ARCH_MIPS64,
-	"SCMP_ARCH_MIPS64N32":   unix.AUDIT_ARCH_MIPS64N32,
-	"SCMP_ARCH_MIPSEL":      unix.AUDIT_ARCH_MIPSEL,
-	"SCMP_ARCH_MIPSEL64":    unix.AUDIT_ARCH_MIPSEL64,
-	"SCMP_ARCH_MIPSEL64N32": unix.AUDIT_ARCH_MIPSEL64N32,
-	"SCMP_ARCH_PPC":         unix.AUDIT_ARCH_PPC,
-	"SCMP_ARCH_PPC64":       unix.AUDIT_ARCH_PPC64,
-	"SCMP_ARCH_PPC64LE":     unix.AUDIT_ARCH_PPC64LE,
-	"SCMP_ARCH_RISCV64":     unix.AUDIT_ARCH_RISCV64,
-	"SCMP_ARCH_S390":        unix.AUDIT_ARCH_S390,
-	"SCMP_ARCH_S390X":       unix.AUDIT_ARCH_S390X,
-	"SCMP_ARCH_LOONGARCH64": unix.AUDIT_ARCH_LOONGARCH64,
-}
-
-// archIs32Bit reports whether an architecture compares only the low 32 bits of
-// a syscall argument, which is what libseccomp does when its arch definition
-// has ARCH_SIZE_32. It cannot be read off the AUDIT_ARCH value: x32 shares
-// x86_64's value and is 32-bit, and the two mips n32 ABIs set the 64-bit bit
-// in their own. An architecture not listed is 64-bit.
-var archIs32Bit = map[string]bool{
-	"SCMP_ARCH_X86":         true,
-	"SCMP_ARCH_X32":         true,
-	"SCMP_ARCH_ARM":         true,
-	"SCMP_ARCH_MIPS":        true,
-	"SCMP_ARCH_MIPS64N32":   true,
-	"SCMP_ARCH_MIPSEL":      true,
-	"SCMP_ARCH_MIPSEL64N32": true,
-	"SCMP_ARCH_PPC":         true,
-	"SCMP_ARCH_S390":        true,
-}
-
-// archLittleEndian reports an architecture's byte order. libseccomp refuses to
-// add an architecture whose byte order differs from the native one -- its filter
-// cannot compare seccomp_data in both orders, so db_col_db_add() returns EDOM --
-// and the cgo-free build refuses the same ones. An architecture not listed is
-// treated as the native byte order and is never refused.
-var archLittleEndian = map[string]bool{
-	"SCMP_ARCH_X86":         true,
-	"SCMP_ARCH_X86_64":      true,
-	"SCMP_ARCH_X32":         true,
-	"SCMP_ARCH_ARM":         true,
-	"SCMP_ARCH_AARCH64":     true,
-	"SCMP_ARCH_LOONGARCH64": true,
-	"SCMP_ARCH_MIPS":        false,
-	"SCMP_ARCH_MIPS64":      false,
-	"SCMP_ARCH_MIPS64N32":   false,
-	"SCMP_ARCH_MIPSEL":      true,
-	"SCMP_ARCH_MIPSEL64":    true,
-	"SCMP_ARCH_MIPSEL64N32": true,
-	"SCMP_ARCH_PPC":         false,
-	"SCMP_ARCH_PPC64":       false,
-	"SCMP_ARCH_PPC64LE":     true,
-	"SCMP_ARCH_RISCV64":     true,
-	"SCMP_ARCH_S390":        false,
-	"SCMP_ARCH_S390X":       false,
-}
-
 // archSyscallTables returns an architecture's syscall name -> number table and
 // its multiplexor table. libseccomp's generated tables (libseccomp_linux.go) are
 // authoritative wherever they exist, so the two builds resolve the same names;
@@ -206,11 +140,12 @@ func seccompRetAction(action configs.Action, errnoRet *uint) (uint32, error) {
 // nativeSeccompArch returns the seccomp architecture name for the architecture
 // runc was built for.
 func nativeSeccompArch() (string, error) {
-	arch, ok := goarchToSeccompArch[runtime.GOARCH]
-	if !ok {
-		return "", fmt.Errorf("no seccomp syscall table for GOARCH %q", runtime.GOARCH)
+	for name, a := range seccompArches {
+		if a.goarch == runtime.GOARCH {
+			return name, nil
+		}
 	}
-	return arch, nil
+	return "", fmt.Errorf("no seccomp syscall table for GOARCH %q", runtime.GOARCH)
 }
 
 // archSection is one architecture's worth of compiled rules.
@@ -227,11 +162,11 @@ type archSection struct {
 // "SCMP_ARCH_X86_64" into the short "amd64" for configs.Seccomp.Architectures,
 // while the native architecture is known here by its SCMP_ARCH_* name.
 func normalizeArch(name string) (string, bool) {
-	if _, ok := auditArch[name]; ok {
+	if _, ok := seccompArches[name]; ok {
 		return name, true
 	}
-	for scmp, short := range archs {
-		if short == name {
+	for scmp, a := range seccompArches {
+		if a.oci == name {
 			return scmp, true
 		}
 	}
@@ -284,7 +219,7 @@ func compileFilter(config *configs.Seccomp) ([]bpf.Instruction, error) {
 		// failed install. Refusing the same architectures keeps the two builds
 		// equivalent: an extra section the kernel can never match is not the
 		// same filter if one build installs it and the other does not.
-		if little, ok := archLittleEndian[arch]; ok && little != !isBigEndian {
+		if a, ok := seccompArches[arch]; ok && a.littleEndian != !isBigEndian {
 			return nil, fmt.Errorf("error adding architecture to seccomp filter: %w", unix.EDOM)
 		}
 
@@ -301,7 +236,7 @@ func compileFilter(config *configs.Seccomp) ([]bpf.Instruction, error) {
 		if err != nil {
 			return nil, err
 		}
-		sections = append(sections, archSection{auditArch: auditArch[arch], arch: arch, prog: prog})
+		sections = append(sections, archSection{auditArch: seccompArches[arch].audit, arch: arch, prog: prog})
 	}
 
 	prog, err := assembleFilter(sections)
@@ -907,7 +842,7 @@ func compileArchSection(config *configs.Seccomp, table map[string]uint32, pseudo
 
 	const defaultLabel = "default"
 	b := &builder{}
-	t := &treeEmitter{b: b, word32: archIs32Bit[arch]}
+	t := &treeEmitter{b: b, word32: seccompArches[arch].is32}
 	b.emit(bpf.LoadAbsolute{Off: seccompDataNr, Size: 4})
 
 	// On the x86_64 ABI, an x32 syscall signals itself with bit 30 of the

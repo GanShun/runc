@@ -105,16 +105,6 @@ var syscallNumbers = map[string]map[string]uint32{
 	}
 	fmt.Fprintf(&buf, "}\n")
 
-	fmt.Fprintf(&buf, `
-// goarchToSeccompArch maps runtime.GOARCH to the seccomp architecture name used
-// by OCI seccomp profiles.
-var goarchToSeccompArch = map[string]string{
-`)
-	for _, a := range goarchToSeccomp {
-		fmt.Fprintf(&buf, "\t%q: %q,\n", a.goarch, a.seccomp)
-	}
-	fmt.Fprintf(&buf, "}\n")
-
 	src, err := format.Source(buf.Bytes())
 	if err != nil {
 		fatal(fmt.Errorf("formatting generated source: %w", err))

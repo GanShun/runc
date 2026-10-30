@@ -80,7 +80,7 @@ func modelSections(config *configs.Seccomp) []modelSection {
 func modelSectionFor(sections []modelSection, audit uint32, nr uint32) (modelSection, bool) {
 	var candidates []modelSection
 	for _, s := range sections {
-		if auditArch[s.arch] == audit {
+		if seccompArches[s.arch].audit == audit {
 			candidates = append(candidates, s)
 		}
 	}
@@ -144,7 +144,7 @@ func modelRuleMatches(rule *configs.Syscall, sec modelSection, nr uint32, args [
 	if !isPseudo && !inTable {
 		return false
 	}
-	word32 := archIs32Bit[sec.arch]
+	word32 := seccompArches[sec.arch].is32
 
 	conditions := [][]*configs.Arg{rule.Args}
 	if modelArgIndexesRepeat(rule.Args) {
@@ -452,19 +452,19 @@ func shortNativeArch() (string, error) {
 	if err != nil {
 		return "", err
 	}
-	short, ok := archs[scmp]
+	a, ok := seccompArches[scmp]
 	if !ok {
 		return "", errBadTestProfile
 	}
-	return short, nil
+	return a.oci, nil
 }
 
 // shortArchList maps a mixed list of architecture spellings to short names.
 func shortArchList(names []string) []string {
 	out := make([]string, 0, len(names))
 	for _, name := range names {
-		if short, ok := archs[name]; ok {
-			out = append(out, short)
+		if a, ok := seccompArches[name]; ok {
+			out = append(out, a.oci)
 			continue
 		}
 		out = append(out, name)
@@ -475,11 +475,11 @@ func shortArchList(names []string) []string {
 // scmpArchForShort maps a short architecture name back to its SCMP_ARCH_* name,
 // accepting either spelling.
 func scmpArchForShort(name string) (string, bool) {
-	if _, ok := auditArch[name]; ok {
+	if _, ok := seccompArches[name]; ok {
 		return name, true
 	}
-	for scmp, short := range archs {
-		if short == name {
+	for scmp, a := range seccompArches {
+		if a.oci == name {
 			return scmp, true
 		}
 	}
@@ -759,7 +759,7 @@ func auditArchesToTry(t *testing.T, config *configs.Seccomp) []uint32 {
 		if !ok {
 			t.Fatalf("unknown architecture %q", name)
 		}
-		a := auditArch[scmp]
+		a := seccompArches[scmp].audit
 		if seen[a] {
 			continue
 		}
@@ -796,7 +796,7 @@ func syscallNumbersToTry(config *configs.Seccomp, audits []uint32) []uint32 {
 		}
 		for _, audit := range audits {
 			for _, sec := range sections {
-				if auditArch[sec.arch] != audit {
+				if seccompArches[sec.arch].audit != audit {
 					continue
 				}
 				if num, ok := sec.table[rule.Name]; ok {
@@ -843,7 +843,7 @@ func allNumbersToTry(config *configs.Seccomp, audits []uint32) []uint32 {
 	sections := modelSections(config)
 	for _, audit := range audits {
 		for _, sec := range sections {
-			if auditArch[sec.arch] != audit {
+			if seccompArches[sec.arch].audit != audit {
 				continue
 			}
 			for _, nr := range sec.table {
@@ -1091,8 +1091,8 @@ func TestProgramsWellFormed(t *testing.T) {
 
 // archs0 is a typo guard: it returns the SCMP_ARCH_* name for a short name.
 func archs0(short string) string {
-	for scmp, s := range archs {
-		if s == short {
+	for scmp, a := range seccompArches {
+		if a.oci == short {
 			return scmp
 		}
 	}

@@ -47,31 +47,17 @@ func KnownActions() []string {
 	return slices.Sorted(maps.Keys(actions))
 }
 
-var archs = map[string]string{
-	"SCMP_ARCH_X86":         "x86",
-	"SCMP_ARCH_X86_64":      "amd64",
-	"SCMP_ARCH_X32":         "x32",
-	"SCMP_ARCH_ARM":         "arm",
-	"SCMP_ARCH_AARCH64":     "arm64",
-	"SCMP_ARCH_MIPS":        "mips",
-	"SCMP_ARCH_MIPS64":      "mips64",
-	"SCMP_ARCH_MIPS64N32":   "mips64n32",
-	"SCMP_ARCH_MIPSEL":      "mipsel",
-	"SCMP_ARCH_MIPSEL64":    "mipsel64",
-	"SCMP_ARCH_MIPSEL64N32": "mipsel64n32",
-	"SCMP_ARCH_PPC":         "ppc",
-	"SCMP_ARCH_PPC64":       "ppc64",
-	"SCMP_ARCH_PPC64LE":     "ppc64le",
-	"SCMP_ARCH_RISCV64":     "riscv64",
-	"SCMP_ARCH_S390":        "s390",
-	"SCMP_ARCH_S390X":       "s390x",
-	"SCMP_ARCH_LOONGARCH64": "loong64",
-}
+// archShortNames maps an SCMP_ARCH_* name to the short name OCI profiles use.
+// It is a derived view of seccompArches, the single architecture table, filled
+// by init() in arch_linux.go. On a build without that table it is empty and the
+// arch-name helpers report nothing, which matches this package having no
+// compiler there either.
+var archShortNames map[string]string
 
 // KnownArchs returns the list of the known archs.
 // Used by `runc features`.
 func KnownArchs() []string {
-	return slices.Sorted(maps.Keys(archs))
+	return slices.Sorted(maps.Keys(archShortNames))
 }
 
 // ConvertStringToOperator converts a string into a Seccomp comparison operator.
@@ -98,7 +84,7 @@ func ConvertStringToAction(in string) (configs.Action, error) {
 
 // ConvertStringToArch converts a string into a Seccomp comparison arch.
 func ConvertStringToArch(in string) (string, error) {
-	if arch, ok := archs[in]; ok {
+	if arch, ok := archShortNames[in]; ok {
 		return arch, nil
 	}
 	return "", fmt.Errorf("string %s is not a valid arch for seccomp", in)

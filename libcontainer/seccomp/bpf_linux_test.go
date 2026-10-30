@@ -69,11 +69,11 @@ func nativeAuditArch(t *testing.T) uint32 {
 	if err != nil {
 		t.Fatalf("nativeSeccompArch: %v", err)
 	}
-	audit, ok := auditArch[arch]
+	a, ok := seccompArches[arch]
 	if !ok {
 		t.Fatalf("no audit arch for %q", arch)
 	}
-	return audit
+	return a.audit
 }
 
 // syscallNumber returns a syscall number that the tests can use, so they do
