@@ -223,6 +223,19 @@ func compileFilter(config *configs.Seccomp) ([]bpf.Instruction, error) {
 			return nil, fmt.Errorf("error adding architecture to seccomp filter: %w", unix.EDOM)
 		}
 
+		// The generated libseccomp table has no entry for this architecture,
+		// but the kernel headers do. That is the off-native loongarch64 case:
+		// libseccomp 2.5.5 cannot add it, so the cgo build refuses to install
+		// the filter, and filtering it here would install a filter the cgo
+		// build rejects. Refuse it too, as the byte-order check above does. The native architecture is exempt: its
+		// kernel-header numbering is the right one and there is no cgo build
+		// to differ from.
+		if _, libseccompTable := libseccompSyscalls[arch]; !libseccompTable && arch != native {
+			if _, kernelHeader := syscallNumbers[arch]; kernelHeader {
+				return nil, fmt.Errorf("error adding architecture to seccomp filter: %s is not supported by the generated libseccomp table", arch)
+			}
+		}
+
 		table, pseudo, ok := archSyscallTables(arch)
 		if !ok {
 			// No name table for this architecture. Leaving it out of the

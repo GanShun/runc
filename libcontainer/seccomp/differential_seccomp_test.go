@@ -79,8 +79,7 @@ func TestAgainstLibseccomp(t *testing.T) {
 }
 
 // TestAgainstLibseccompPseudoSyscall compares the two compilers on the
-// multiplexed socket and ipc syscalls, which are the divergence-1 case in
-// docs/seccomp-go-vs-libseccomp.md. libseccomp rewrites a rule for `socket` on an
+// multiplexed socket and ipc syscalls. libseccomp rewrites a rule for `socket` on an
 // architecture that multiplexes it into a rule on socketcall(2) with argument 0
 // equal to SYS_SOCKET, plus the flat syscall number; the compiler has to do the
 // same, and the high-bit argument sets below are what catch a comparison against
@@ -164,17 +163,17 @@ func TestAgainstLibseccompPseudoSyscall(t *testing.T) {
 		cases, differences, len(ours), len(theirs))
 }
 
-// TestDivergence7LibseccompRefusesArch is the cgo half of the divergence-7
+// TestLibseccompRefusesUnusableArch is the cgo half of the unusable-architecture
 // pin: both builds must refuse a profile that lists an architecture libseccomp
 // will not add. buildFilter is not exported to InitSeccomp, so this only
 // compiles a filter; nothing is installed.
-func TestDivergence7LibseccompRefusesArch(t *testing.T) {
+func TestLibseccompRefusesUnusableArch(t *testing.T) {
 	config := &configs.Seccomp{
 		DefaultAction: configs.Allow,
 		Architectures: []string{"mips64n32"},
 	}
 	if _, err := buildFilter(config); err == nil {
-		t.Errorf("libseccomp accepted mips64n32 on amd64, so the divergence is gone")
+		t.Errorf("libseccomp accepted mips64n32 on amd64, so the case is gone")
 	}
 	if _, err := compileFilter(config); err == nil {
 		t.Errorf("the Go compiler accepted mips64n32; it must refuse what libseccomp refuses")

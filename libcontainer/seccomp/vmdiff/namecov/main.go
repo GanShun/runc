@@ -4,8 +4,8 @@
 // (libcontainer/seccomp/syscalls_linux.go) against the names libseccomp
 // resolves, per architecture.
 //
-// It is the tool that found the name-coverage divergence written up in
-// docs/seccomp-go-vs-libseccomp.md, and it still shows which kernel-header
+// It is the tool that found the name-coverage difference described in
+// docs/seccomp-go-vs-libseccomp.md on the docs branch, and it still shows which kernel-header
 // names libseccomp does not resolve (the ones the generated
 // libseccomp_linux.go drops) and which it resolves differently. The compiler
 // itself no longer resolves from the kernel-header table, so this is a check on

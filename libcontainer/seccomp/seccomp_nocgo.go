@@ -79,10 +79,17 @@ func filterFlags(config *configs.Seccomp) (uint, error) {
 	for _, flag := range config.Flags {
 		switch flag {
 		case flagTsync:
-			// Not something the profile has to ask for in the cgo build,
-			// where libseccomp always applies the filter to every thread.
-			// Asking for it here is the closest equivalent, and harmless at
-			// the point runc installs the filter.
+			// Map the profile's explicit request to the kernel flag. The cgo
+			// build does not: its setFlag treats tsync as a no-op on the belief
+			// that libseccomp-golang's filter always syncs, but runc exports
+			// the BPF and loads it through patchbpf, and that path never sets
+			// SECCOMP_FILTER_FLAG_TSYNC. So the two builds agree when the
+			// profile does not ask -- neither syncs, and a filter installed
+			// with prctl(2) covers the calling thread only -- and this build is
+			// the one that honours an explicit request. A multi-threaded
+			// installer needs the flag to have every thread filtered.
+			// TestFilterSyncsOnlyWhenAsked (seccomp_nocgo_tsync_test.go) pins
+			// this against the kernel.
 			flags |= unix.SECCOMP_FILTER_FLAG_TSYNC
 		case specs.LinuxSeccompFlagLog:
 			flags |= unix.SECCOMP_FILTER_FLAG_LOG

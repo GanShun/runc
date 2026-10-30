@@ -15,16 +15,16 @@ import (
 	"github.com/opencontainers/runc/libcontainer/configs"
 )
 
-// This file pins the seven root causes in docs/seccomp-go-vs-libseccomp.md.
-// Each test compiles the exact profile the document measured and asserts what
-// the compiled program does, in the x/net/bpf interpreter, so a regression is
-// caught without a VM. All seven are now fixed, and each test asserts the
-// fixed behaviour -- that the cgo-free build does what libseccomp and runc's
-// cgo path do, including where that means refusing or dropping something.
+// These tests pin the cases where the cgo-free compiler must do what libseccomp
+// and runc's cgo path do, including where that means refusing or dropping
+// something. Each is named for its case, compiles the profile that case needs,
+// and asserts what the compiled program does in the x/net/bpf interpreter, so a
+// regression is caught without a VM.
 //
-// The document is a measurement, so the profiles here are copied from it
-// verbatim: a change to one of these tests means the document's numbers no
-// longer describe this compiler and has to be re-measured.
+// The measurement behind them -- the profiles, what the kernel did with each
+// build's filter, and the history of which cases were briefly wrong -- is
+// docs/seccomp-go-vs-libseccomp.md on this repository's docs branch, which is not
+// part of this tree.
 
 // skipUnlessAmd64 skips a test whose syscall numbers are the document's. It
 // measured on amd64; the same names have different numbers elsewhere, so the
@@ -62,10 +62,11 @@ func argWordLoads(prog []bpf.Instruction, off uint32) int {
 	return n
 }
 
-// Divergence 1: a rule for socket on an architecture that multiplexes it must
-// also block socketcall(2). Fixed: the compiler now emits a rule on the
-// multiplexor with argument 0 equal to the subcall, alongside the flat number.
-func TestDivergence1Socketcall(t *testing.T) {
+// A rule for socket on an architecture that multiplexes it must also block
+// socketcall(2): libseccomp emits a rule on the multiplexor with argument 0 equal
+// to the subcall, alongside the flat number, and a filter that covers only the
+// flat number lets socketcall(SYS_SOCKET, ...) through.
+func TestMultiplexedSocketRule(t *testing.T) {
 	skipUnlessAmd64(t)
 	eacces := uint(unix.EACCES)
 	config := &configs.Seccomp{
@@ -129,9 +130,9 @@ func TestDivergence1Socketcall(t *testing.T) {
 	}
 }
 
-// Divergence 1 also covers the System V IPC family, which is multiplexed
-// through ipc(2) with subcall = (-pseudo) % 200.
-func TestDivergence1IPCCall(t *testing.T) {
+// The System V IPC family is multiplexed the same way, through ipc(2) with
+// subcall = (-pseudo) % 200.
+func TestMultiplexedIPCRule(t *testing.T) {
 	eacces := uint(unix.EACCES)
 	config := &configs.Seccomp{
 		DefaultAction: configs.Allow,
@@ -162,11 +163,10 @@ func TestDivergence1IPCCall(t *testing.T) {
 	}
 }
 
-// Divergence 2: the cgo build's matchCall drops a rule whose action equals the
-// profile's default action whatever its arguments; the Go compiler used to keep
-// an argument-carrying one. Fixed: the redundant rule is gone, so the later
-// stricter rule is not shadowed.
-func TestDivergence2RedundantRuleDropped(t *testing.T) {
+// runc's cgo path drops a rule whose action equals the profile's default action
+// whatever its arguments: such a rule cannot change an outcome, and keeping it
+// lets it match first and shadow a later, stricter rule for the same syscall.
+func TestRuleRepeatingDefaultActionDropped(t *testing.T) {
 	eacces := uint(unix.EACCES)
 	redundant := func() *configs.Seccomp {
 		return &configs.Seccomp{
@@ -217,11 +217,10 @@ func TestDivergence2RedundantRuleDropped(t *testing.T) {
 	}
 }
 
-// Divergence 3: the -ENOSYS boundary used to be computed from each
-// implementation's own name table. Fixed: the cgo-free compiler resolves names
-// through the table generated from libseccomp, so a name libseccomp cannot
-// resolve does not move the boundary either.
-func TestDivergence3EnosysBoundary(t *testing.T) {
+// The -ENOSYS boundary is the largest number the profile's rule names resolve to.
+// Resolving names through the table generated from libseccomp keeps it where the
+// cgo build puts it, and a name libseccomp cannot resolve cannot move it.
+func TestEnosysBoundaryFromLibseccompTable(t *testing.T) {
 	skipUnlessAmd64(t)
 	config := &configs.Seccomp{
 		DefaultAction: configs.Errno,
@@ -257,11 +256,11 @@ func TestDivergence3EnosysBoundary(t *testing.T) {
 	}
 }
 
-// Divergence 4: the Go table used to come from x/sys/unix and libseccomp's from
-// its own database, so the two disagreed about names. Fixed: the generated
-// table is extracted from libseccomp, so a name libseccomp cannot resolve is
-// dropped by both builds and a name it resolves is enforced by both.
-func TestDivergence4NameCoverage(t *testing.T) {
+// The name table is extracted from libseccomp, so a name it cannot resolve is
+// dropped by both builds and a name it resolves is enforced by both. libseccomp
+// 2.5.5 has no entry for statmount, listmount or the lsm_* calls this test
+// names.
+func TestNameCoverageFromLibseccompTable(t *testing.T) {
 	skipUnlessAmd64(t)
 	arch := nativeAuditArch(t)
 	// Names this checkout's x/sys/unix has and libseccomp 2.5.5 does not. The
@@ -296,11 +295,11 @@ func TestDivergence4NameCoverage(t *testing.T) {
 	}
 }
 
-// Divergence 5: two conditions on one argument. Fixed: runc's cgo path splits
-// them into separate rules, because libseccomp's db_col_rule_add rejects a
-// second condition on an argument index it has already seen, and the cgo-free
-// compiler now splits the same way. The semantics are OR, not AND.
-func TestDivergence5TwoConditionsOneArgument(t *testing.T) {
+// Two conditions on one argument. runc's cgo path gives each condition a rule of
+// its own, because libseccomp rejects a second condition on an argument index it
+// has already seen, so either value matches; ANDing them would make a rule that
+// can never match.
+func TestTwoConditionsOnOneArgument(t *testing.T) {
 	eacces := uint(unix.EACCES)
 	config := &configs.Seccomp{
 		DefaultAction: configs.Allow,
@@ -328,11 +327,11 @@ func TestDivergence5TwoConditionsOneArgument(t *testing.T) {
 	}
 }
 
-// Divergence 6: with SCMP_ARCH_X32 listed, libseccomp filters x32 numbers
-// through its own x32 table. Fixed: the generated table carries libseccomp's
-// x32 numbering, so the cgo-free compiler compiles an x32 section and
-// assembleFilter dispatches to it on bit 30 of the syscall number.
-func TestDivergence6X32Filtered(t *testing.T) {
+// With SCMP_ARCH_X32 listed, libseccomp filters x32 numbers through its own x32
+// table. The generated table carries that numbering, so the compiler builds an
+// x32 section and assembleFilter dispatches to it on bit 30 of the syscall
+// number.
+func TestX32SectionFromLibseccompTable(t *testing.T) {
 	skipUnlessAmd64(t)
 	eacces := uint(unix.EACCES)
 	read := syscallNumber(t, "read")
@@ -378,11 +377,11 @@ func TestDivergence6X32Filtered(t *testing.T) {
 	}
 }
 
-// Divergence 7: libseccomp refuses to add an architecture whose byte order
-// differs from the native one, so the cgo build fails to install a filter that
-// lists one. Fixed: the cgo-free build refuses the same architectures, with the
-// same error, rather than installing a filter the cgo build would reject.
-func TestDivergence7UnusableArchitectureRefused(t *testing.T) {
+// libseccomp refuses to add an architecture whose byte order differs from the
+// native one, so the cgo build cannot install a filter that lists one. The
+// compiler refuses the same architectures, with the same error, rather than
+// installing a filter the cgo build would reject.
+func TestUnusableArchitectureRefused(t *testing.T) {
 	if runtime.GOARCH != "amd64" || isBigEndian {
 		t.Skip("the case is a big-endian architecture added to a little-endian filter")
 	}
@@ -410,6 +409,33 @@ func TestDivergence7UnusableArchitectureRefused(t *testing.T) {
 	if _, err := compileFilter(config); err != nil {
 		t.Errorf("compileFilter refused little-endian mipsel64n32: %v", err)
 	}
+}
+
+// The other half of that case: an architecture the generated libseccomp table
+// has no entry for. libseccomp 2.5.5 has none for loongarch64, so the cgo
+// build's AddArch refuses it ("architecture loong64 is not supported on this
+// version of the library") and the install fails. Off-native, the cgo-free
+// compiler must refuse it too rather than filter it from the kernel-header
+// table, or a profile that lists it installs a filter the cgo build rejects.
+// The native architecture is exempt because the kernel-header numbering is the
+// right one for it and there is no cgo build to differ from; that path is a
+// native loong64 build's and cannot be exercised on amd64.
+func TestArchWithoutLibseccompTableRefusedOffNative(t *testing.T) {
+	if runtime.GOARCH == "loong64" {
+		t.Skip("loong64 is the native architecture here, where the fallback is deliberate")
+	}
+	if _, ok := libseccompSyscalls["SCMP_ARCH_LOONGARCH64"]; ok {
+		t.Skip("the committed libseccomp table covers loongarch64")
+	}
+	config := &configs.Seccomp{
+		DefaultAction: configs.Allow,
+		Architectures: []string{"loong64"},
+	}
+	_, err := compileFilter(config)
+	if err == nil {
+		t.Fatal("compileFilter filtered loong64 from the kernel-header table; the cgo build refuses to add it")
+	}
+	t.Logf("refused: %v", err)
 }
 
 // TestX32PairSharesOneArchiveValue pins the dispatch: two sections share the
