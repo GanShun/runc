@@ -617,6 +617,19 @@ func modelProfiles(t *testing.T) map[string]*configs.Seccomp {
 				},
 			},
 		},
+		"one-arg-twice": {
+			DefaultAction: configs.Errno,
+			Syscalls: []*configs.Syscall{
+				{
+					Name:   "close",
+					Action: configs.Allow,
+					Args: []*configs.Arg{
+						{Index: 0, Op: configs.EqualTo, Value: 12345},
+						{Index: 0, Op: configs.EqualTo, Value: 12346},
+					},
+				},
+			},
+		},
 		"extra-architectures": {
 			DefaultAction: configs.Errno,
 			Architectures: []string{"x86", "x32"},

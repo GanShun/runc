@@ -8,6 +8,16 @@
 
 package seccomp
 
+// libseccompGeneratedVersion is the version of libseccomp whose syscall tables
+// this file holds, as reported by seccomp_version(). The cgo-free compiler
+// resolves names from these tables while the cgo build resolves them from the
+// libseccomp it links against, so when the two differ a name the newer library
+// knows is absent here and its rule is dropped -- for a deny rule, fail-open.
+// TestGeneratedTablesMatchCommitted fails when this does not match the
+// libseccomp on the build host and when the generated content differs from this
+// file.
+const libseccompGeneratedVersion = "2.5.5"
+
 // pseudoSyscall is one syscall name an architecture multiplexes through a
 // multiplexor: libseccomp emits a rule on the multiplexor's number with
 // argument 0 equal to subcall, and, when the architecture has a direct-wired

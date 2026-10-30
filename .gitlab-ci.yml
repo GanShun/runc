@@ -44,3 +44,38 @@ seccomp-table-drift:
   script:
     - test "$(pkg-config --modversion libseccomp)" = "$LIBSECCOMP_VERSION"
     - CGO_ENABLED=1 go test -tags seccomp -run TestGeneratedTablesMatchCommitted ./libcontainer/seccomp/
+
+# The differential against libseccomp needs cgo, so `make cover` never runs it:
+# it is CGO_ENABLED=0. Without this job nothing in CI compares the two
+# compilers, and a libseccomp version skew lands unnoticed.
+seccomp-differential:
+  stage: test
+  rules: *rules
+  before_script: *toolchain
+  script:
+    - test "$(pkg-config --modversion libseccomp)" = "$LIBSECCOMP_VERSION"
+    - CGO_ENABLED=1 go test -tags seccomp ./libcontainer/seccomp/
+
+# The VM differential: the only check that compares what the *kernel* does with
+# each build's filter. Manual, because it boots QEMU under TCG -- the runner has
+# no /dev/kvm -- and that cost belongs in front of a person, not in every MR
+# until its runtime is measured.
+vmdiff:
+  stage: test
+  rules: *rules
+  when: manual
+  allow_failure: true
+  timeout: 1h
+  before_script: *toolchain
+  script:
+    - DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends cpio linux-image-generic qemu-system-x86
+    - export PATH="/usr/local/go/bin:$PATH"
+    - kernel=$(ls /boot/vmlinuz-* | head -1); echo "booting $kernel"
+    - ./libcontainer/seccomp/vmdiff/run.sh "$kernel"
+    - mkdir -p ci-logs && cp /tmp/vmdiff-run/console.log ci-logs/ 2>/dev/null || true
+  artifacts:
+    when: always
+    expose_as: 'vmdiff console'
+    paths:
+      - ci-logs
+    expire_in: 30 days
