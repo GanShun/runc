@@ -12,8 +12,9 @@
 // Both binaries are then run inside a QEMU VM and their real, kernel-observed
 // behaviour is compared per (profile, probe) pair. The existing tests compare
 // the two BPF programs in the x/net/bpf interpreter, so they cannot see
-// anything the kernel does differently -- and they skip the cases where the two
-// builds are known not to agree.
+// anything the kernel does differently. Nothing is skipped: every pair in the
+// corpus is measured, including the ones the two builds disagreed on while the
+// divergences were open, and the differential result is that they agree.
 //
 // Everything here is deliberately isolated from the host: installing a seccomp
 // filter is irreversible for the process that does it, so every filter is

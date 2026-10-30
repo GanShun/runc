@@ -21,19 +21,25 @@ import (
 // loads it; only the loading half exists in Go (see patchbpf), so this
 // reimplements the compilation half.
 //
-// The filter it builds is a linear chain of one block per syscall:
+// The filter it builds is an architecture dispatch followed by a balanced
+// binary search over the syscall number, one leaf per group of rules for a
+// number:
 //
-//	ld  [0]            ; seccomp_data.nr
-//	jne N -> skip body ; this is not the syscall we are looking at
-//	<body>             ; argument tests, then ret <action>
-//	...
+//	ld  [0]              ; seccomp_data.nr
+//	jge P -> right       ; descend: numbers below the pivot go left
+//	...                  ; left subtree
+//	right: ...
+//	jeq N -> body        ; a leaf checks equality, since the descent lands on
+//	                     ; the nearest key rather than necessarily N
+//	<body>               ; argument tests, then ret <action>
 //	ret <default>
 //
-// A linear chain is correct but runs in O(number of rules) per syscall, where
-// libseccomp builds a binary search tree and runs in O(log n). The default
-// profile has several hundred rules, so this is the main thing to improve; the
-// chain is used first because every jump in it is short, which keeps the
-// encoder simple, whereas a tree needs long jumps through 32-bit unconditonals.
+// A syscall costs O(log rules) comparisons, where a linear chain would cost
+// O(number of rules); the default profile has several hundred rules. A cBPF
+// conditional jump only reaches 255 instructions, which a tree's jumps can
+// exceed, so `builder` records labels and resolves them once the layout
+// settles, splitting a long conditional into a short one over a 32-bit
+// unconditional jump.
 
 // x32SyscallBit marks an x32 syscall. x32 is an ILP32 ABI on x86-64, signalled
 // per syscall rather than per process: seccomp_data.arch is AUDIT_ARCH_X86_64
@@ -88,11 +94,12 @@ const (
 )
 
 // archSyscallTables returns an architecture's syscall name -> number table and
-// its multiplexor table. libseccomp's generated tables (libseccomp_linux.go) are
-// authoritative wherever they exist, so the two builds resolve the same names;
-// the kernel-header table (syscalls_linux.go) is the fallback for an
-// architecture the libseccomp these were generated from has no table for -- on
-// libseccomp 2.5.5 that is loongarch64 only.
+// its multiplexor table. The generated libseccomp table (libseccomp_linux.go) is
+// authoritative wherever it has an entry, so the two builds resolve the same
+// names; the kernel-header table (syscalls_linux.go) is the fallback for an
+// architecture the generated table does not cover -- on libseccomp 2.5.5 that is
+// loongarch64 only. compileFilter refuses an off-native architecture that needs
+// that fallback, because the cgo build refuses to add it; see the guard there.
 func archSyscallTables(arch string) (map[string]uint32, map[string]pseudoSyscall, bool) {
 	if table, ok := libseccompSyscalls[arch]; ok {
 		return table, libseccompPseudo[arch], true
@@ -238,9 +245,9 @@ func compileFilter(config *configs.Seccomp) ([]bpf.Instruction, error) {
 
 		table, pseudo, ok := archSyscallTables(arch)
 		if !ok {
-			// No name table for this architecture. Leaving it out of the
-			// dispatch means the filter's bad-architecture action refuses it,
-			// which is fail-closed and better than filtering it with the wrong
+			// No name table at all. Leaving it out of the dispatch means
+			// the filter's bad-architecture action refuses it, which is
+			// fail-closed and better than filtering it with the wrong
 			// numbering.
 			logrus.Warnf("seccomp: no syscall table for architecture %q, refusing it rather than filtering it", name)
 			continue
@@ -525,7 +532,8 @@ type treeEmitter struct {
 	b    *builder
 	next int
 	// word32 is set for a 32-bit architecture, whose arguments have no high
-	// word and are compared the way libseccomp compares them (see archIs32Bit).
+	// word and are compared the way libseccomp compares them (see
+	// seccompArch.is32).
 	word32 bool
 }
 

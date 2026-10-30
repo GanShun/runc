@@ -43,8 +43,10 @@ which syscall names resolve, and what the kernel does with the result.
 - `VMDIFF_PROGRESS=1` -- trace progress to the guest console.
 - `TIMEOUT=600` -- QEMU wall-clock limit.
 
-`/dev/kvm` is used when it is available. A full run is about 991 pairs per build
-and takes well under a minute.
+`/dev/kvm` is used when it is available. A full run is 1014 pairs per build
+and takes well under a minute. The run prints the count itself, as
+`--- N (case,probe) pairs compared, D divergences ---`; the current tip
+reports 1014 and 0.
 
 ## Nothing touches the host
 

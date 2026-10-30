@@ -89,8 +89,14 @@ var featuresCommand = cli.Command{
 				KnownFlags:     seccomp.KnownFlags(),
 				SupportedFlags: seccomp.SupportedFlags(),
 			}
-			// All zero means there is no libseccomp in this build (the
-			// cgo-free one), so there is no version to claim.
+			// The libseccomp-version annotation is emitted only when there is a
+			// libseccomp to name. The cgo-free build has none, and
+			// seccomp.Version() reports (0, 0, 0) there; reporting "0.0.0"
+			// would claim a library version that does not exist rather than
+			// say there is no library, so the annotation is omitted instead.
+			// The seccomp block itself still reports Enabled, actions,
+			// operators, archs and flags, which is what a caller must read to
+			// know this build compiles and installs filters.
 			if major, minor, patch := seccomp.Version(); major+minor+patch > 0 {
 				feat.Annotations[runcfeatures.AnnotationLibseccompVersion] = fmt.Sprintf("%d.%d.%d", major, minor, patch)
 			}

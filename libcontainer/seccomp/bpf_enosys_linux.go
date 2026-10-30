@@ -38,6 +38,15 @@ type lastSyscallMap map[uint32]map[string]uint32
 // syscall should not be turned into ENOSYS. Trace counts as permissive: a
 // tracer is expected to handle ENOSYS itself, and taking that decision away
 // hurts emulation.
+//
+// This is a deliberate copy of patchbpf.isAllowAction, and seccompRetAction in
+// bpf_linux.go overlaps seccomp_linux.go's getAction: both builds must classify
+// the same configs.Action values the same way, but the two live behind
+// `cgo && seccomp` and `!cgo` build tags in different packages and encode an
+// action into different representations (a uint32 SECCOMP_RET_* value here, a
+// libseccomp ScmpAction there), so there is no single implementation to share.
+// The duplication is waived, not overlooked: a change to the action set must be
+// made on both sides, and TestAgainstLibseccomp is what catches a divergence.
 func isAllowAction(action configs.Action) bool {
 	switch action {
 	case configs.Allow, configs.Log, configs.Trace:

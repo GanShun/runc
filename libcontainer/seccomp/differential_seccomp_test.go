@@ -181,10 +181,14 @@ func TestLibseccompRefusesUnusableArch(t *testing.T) {
 }
 
 // libseccompProgram builds what runc's cgo build would install for a profile:
-// libseccomp compiles it, then patchbpf prepends the -ENOSYS stub. Comparing
-// against libseccomp's own output without the patch would report a difference
-// for every syscall number past the end of the profile, which is the one thing
-// the stub exists to change.
+// libseccomp compiles it, then patchbpf prepends the -ENOSYS stub. Both halves
+// are upstream and unmodified -- the stub is not something this fork adds. The
+// pure-Go compiler reproduces it in bpf_enosys_linux.go because the cgo-free
+// build never runs patchbpf at all: that package is behind `cgo && seccomp`,
+// so without the port the stub would be missing from the path we ship.
+// Comparing against libseccomp's own output without the patch would report a
+// difference for every syscall number past the end of the profile, which is the
+// one thing the stub exists to change.
 func libseccompProgram(config *configs.Seccomp) ([]bpf.Instruction, error) {
 	filter, err := buildFilter(config)
 	if err != nil {
