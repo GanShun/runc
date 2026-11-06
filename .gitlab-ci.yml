@@ -79,3 +79,60 @@ vmdiff:
     paths:
       - ci-logs
     expire_in: 30 days
+
+# The root-only tests: real namespaces, real mounts, a real cgroup. They need
+# CAP_SYS_ADMIN and a writable cgroupfs, so the job probes for both first and
+# says so, rather than reporting a test failure that reads like a code defect.
+libcontainer-integration:
+  stage: test
+  rules: *rules
+  when: manual
+  allow_failure: true
+  timeout: 30m
+  before_script: *toolchain
+  script:
+    - |
+      if ! unshare --mount --pid --fork true 2>/dev/null; then
+        echo "this runner cannot create namespaces: the pod needs CAP_SYS_ADMIN (privileged: true)"
+        echo "see https://gitlab.corp.dxecleaner.org/k4s/runc/-/issues/4"
+        exit 1
+      fi
+      echo "namespaces: ok"
+    - |
+      if ! (mkdir /sys/fs/cgroup/k4s-probe 2>/dev/null && rmdir /sys/fs/cgroup/k4s-probe); then
+        echo "this runner has no writable cgroupfs, so libcontainer cannot create the container's cgroup"
+        exit 1
+      fi
+      echo "cgroupfs: writable"
+      # -skip Userns is load-bearing: the -run regex also matches TestExecInUserns
+      # and TestExecInUsernsRlimit, whose only skip is needUserNS (it skips when
+      # /proc/self/ns/user is absent, which a privileged runner has). The cgo-free
+      # build cannot create a user namespace, so they belong below with the other
+      # known-unsupported case, not here where they would paint the job red.
+    - CGO_ENABLED=0 go test ./libcontainer/integration/ -count=1 -v -skip Userns
+        -run 'TestExecIn|TestEnter|TestIPCJoinPath|TestPIDHost|TestHostPidnsInitKill'
+    - |
+      # Two cases this build cannot support: a container init cannot join a PID
+      # namespace by path, and a user namespace cannot be joined or created at
+      # all. They must fail, and they must fail *for that reason* -- a bare
+      # "|| true" would also swallow a regression, or a pass that means the
+      # limitation is gone and the test belongs in the step above.
+      out=/tmp/expected-failures.log
+      CGO_ENABLED=0 go test ./libcontainer/integration/ -count=1 -v \
+        -run 'TestInitJoinPID|TestInitJoinNetworkAndUser|TestExecInUserns$|TestExecInUsernsRlimit$' \
+        > "$out" 2>&1 || true
+      cat "$out"
+      # A file, not a pipe into grep -q: under pipefail a grep that exits early
+      # gives the writer SIGPIPE and the pipeline reports failure.
+      for test in TestInitJoinPID TestInitJoinNetworkAndUser TestExecInUserns TestExecInUsernsRlimit; do
+        # Anchored through the " (", so TestExecInUserns does not match the
+        # TestExecInUsernsRlimit line.
+        if ! grep -q -e "^--- FAIL: $test (" "$out"; then
+          echo "$test did not fail: either it now passes (move it to the step above) or it did not run" >&2
+          exit 1
+        fi
+      done
+      grep -q -e 'not supported without cgo' -e 'operation not permitted' "$out" || {
+        echo "the expected failures did not report the documented refusal" >&2
+        exit 1
+      }
