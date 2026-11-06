@@ -144,6 +144,13 @@ the wiring around it is what is unit-tested, in `TestSplitPidNamespacePath` and
 - Install: `seccomp/seccomp_nocgo.go`, `InitSeccomp`, with `seccomp(2)` and a
   `prctl(2)` fallback when no flags are needed (`loadFilter`), flag translation
   (`filterFlags`), `FlagSupported` and `Enabled = true`.
+- `TSYNC` is always paired with `TSYNC_ESRCH` (`filterFlags`), because `TSYNC`
+  and `NEW_LISTENER` both return a value and the kernel refuses the pair without
+  it: a profile asking for `tsync` that also has a `notify` rule could not load
+  at all. A failed synchronisation then surfaces as a **positive thread id with
+  errno 0** rather than an error, so the return value is read too
+  (`seccompFilterResult`). Reading only errno reports success while a thread runs
+  unfiltered, which is the one thing a profile asking for `tsync` is for.
 
 **Observed running, and how it was checked.** The point of interest is not that
 the compiler is self-consistent but that it agrees with an implementation
@@ -166,6 +173,12 @@ itself; the model test is written from the same reading of the profile
 semantics, so a shared misreading satisfies both. Its x32 carve-out is inside
 `TestAgainstLibseccomp`.
 
+The `TSYNC` pairing is checked against the kernel, not only as a bit pattern:
+`TestTsyncWithNotifyLoads` (`seccomp/seccomp_nocgo_tsync_test.go`) installs a real
+`tsync` + `notify` filter in a child process and requires it to load. Without
+`TSYNC_ESRCH` it fails with `error loading seccomp filter: invalid argument` on
+Linux 6.8 — measured, not inferred.
+
 ### 2.4 `runc exec`: staging into the container's PID namespace
 
 **Why a process has to be created.** `setns(CLONE_NEWPID)` does not move the
@@ -184,15 +197,23 @@ nothing has to survive the fork.
   `startExecNsStage` (start the next stage with `Cloneflags: CLONE_PARENT`,
   report the PID, `CloseOnExec` on the report fd).
 - The parent: `purego_nocgo.go`, `stageExecNs`, rewrites the exec command into
-  `os.Executable() runcns <pid-ns-path> <init-path> <runc argv0> init …`,
-  appends one report pipe to `cmd.ExtraFiles` and removes the PID path from the
-  list the init stage will join (`splitPidNamespacePath`); `container_linux.go`,
+  `<cmd.Path> runcns <pid-ns-path> <init-path> <runc argv0> init …`, appends one
+  report pipe to `cmd.ExtraFiles` and removes the PID path from the list the init
+  stage will join (`splitPidNamespacePath`); `container_linux.go`,
   `newSetnsProcess`, calls it; `process_linux.go`, `setnsProcess.execSetns`,
   branches to `setnsProcess.adoptRuncNsChild`, which reads the reported PID,
   reaps the stage and adopts the process; `signals.go`,
   `signalHandler.forward`, records why `CLONE_PARENT` is load-bearing (the exec'd
   process must be runc's own child, or the `wait4(-1)` reap loop never reports
   it and `runc exec` hangs).
+- The stage is exec'd by the path `newParentProcess` already built for `runc
+  init` — a sealed `/proc/self/fd/N` descriptor, or `/proc/self/exe` when runc is
+  itself a clone — and not by `os.Executable()`, which under a memfd clone names
+  a path that does not exist (§3, item 3). That path is also what the stage
+  passes on as `initExe`, and it stays valid across the extra `execve` because
+  the descriptor is in `cmd.ExtraFiles`. Its `argv[0]`, in contrast, is runc's
+  own: an operator reads it in `ps`, and dispatch reads `os.Args[1]` (`init.go`,
+  `init`), so a descriptor path there would be noise.
 - Two guards the cgo staging used to provide and `!cgo` must not:
   `process_linux.go`, `setnsProcess.start` (do not copy the netlink bootstrap
   payload onto the init pipe) and `container_linux.go`, `newParentProcess` (do
@@ -264,17 +285,18 @@ command or assertion that would close it.
    plus reading `/proc/self/fd` inside the exec'd process and comparing it with
    what a `CGO_ENABLED=1` exec shows.
 
-3. **`os.Executable()` as the stage's path when runc's own executable is a
-   `memfd:` clone.** `stageExecNs` locates the stage with `os.Executable()`
-   (`purego_nocgo.go`), which is `readlink /proc/self/exe`
-   (`$(go env GOROOT)/src/os/executable_procfs.go`). When
-   `exeseal.IsSelfExeCloned()` is true (`container_linux.go`,
-   `newParentProcess`), runc's own `/proc/self/exe` is a sealed memfd;
-   `newParentProcess` handles that for `runc init` by using `/proc/self/exe`
-   directly, and the stage has no equivalent.
-   **Partially observed here:** a process exec'd from a memfd has
-   `os.Executable()` return the memfd link with `" (deleted)"` trimmed, and that
-   path does not exist:
+3. **`runc exec` when runc's own executable is a `memfd:` clone.** This was a
+   hazard in `stageExecNs`, which located the stage with `os.Executable()` while
+   runc's own `/proc/self/exe` was a sealed memfd; the code now execs the stage
+   by the path `newParentProcess` built (`purego_nocgo.go`, `stageExecNs`, and
+   §2.4), so the hazard is closed by construction and
+   `TestStageExecNsWiresStage` asserts the wiring — the sealed path, and the
+   descriptor numbering in `cmd.ExtraFiles` that keeps it valid across the extra
+   `execve`. What is **not** observed is the run itself: no environment here
+   starts a memfd-cloned runc (§2.4). The premise it rests on, that
+   `os.Executable()` cannot be used for this, is observed: a process exec'd from
+   a memfd has `os.Executable()` return the memfd link with `" (deleted)"`
+   trimmed, and that path does not exist:
    ```
    child os.Executable() = "/memfd:runc_cloned" err=<nil>
    child readlink /proc/self/exe = "/memfd:runc_cloned (deleted)"
@@ -283,12 +305,10 @@ command or assertion that would close it.
    (a throwaway Go program using a raw `memfd_create` syscall — 319 on amd64 —
    and `exec.Command("/proc/self/fd/3")`; runc's own memfd is named
    `runc_cloned:<comment>`, `libcontainer/exeseal/cloned_binary_linux.go`,
-   `Memfd`). So the *premise* is observed; whether `runc exec` reaches it is
-   not.
+   `Memfd`).
    *Would settle it:* start runc from a sealed memfd clone of itself so
    `IsSelfExeCloned()` is true, then `runc exec` — a stage failure would surface
-   as a bare `no such file or directory` from the exec, since the stage is
-   exec'd by name.
+   as a bare `no such file or directory` from the exec.
 
 4. **`setsid()`.** nsexec calls it in stage 2 (`nsexec.c`, `nsexec()`) and
    nothing in the Go path reproduces it: `grep -rn setsid libcontainer/` finds
@@ -343,6 +363,45 @@ command or assertion that would close it.
    *Would settle it:* a bundle with a `mount` namespace entry carrying a `path`,
    asserting the container reaches a running state (and, if it does not, which
    of the two opens fails).
+
+8. **The `TSYNC_ESRCH` fallback for kernels older than 5.7.** `loadFilter`
+   (`seccomp/seccomp_nocgo.go`) retries without `TSYNC_ESRCH` if the kernel
+   rejects the flag with `EINVAL` and no listener was asked for, because that flag
+   arrived in 5.7 and an older kernel reports a failed synchronisation *only* by
+   returning a positive thread id. A kernel that knows the flag never takes the
+   retry, so this tree cannot reach the branch: it is verified in code and untested
+   in behaviour.
+   Such a kernel cannot express `tsync` together with `notify` at all, so the
+   question is only whether the retry degrades honestly: a plain `tsync` profile
+   must still load, and `tsync` + `notify` must fail with the kernel's `EINVAL`
+   rather than install a filter on no thread.
+   *Would settle it:* boot a pre-5.7 kernel in the `vmdiff` VM (`run.sh`, which
+   already takes a kernel image) and run
+   `CGO_ENABLED=0 go test ./libcontainer/seccomp/ -count=1` there.
+   `TestTsyncWithNotifyLoads` skips on such a kernel — it probes the flag with a
+   raw `seccomp(2)` first and reports the kernel as lacking it — so the run to
+   read is the rest of the package plus an explicit attempt at `tsync` + `notify`,
+   asserting the `EINVAL`.
+
+9. **The whole of `libcontainer/integration` — the suite that checks any of the
+   above against a real container.** It needs root: it creates namespaces,
+   mounts, cgroups and containers. `.gitlab-ci.yml` carries a
+   `libcontainer-integration` job for it, `manual` and `allow_failure`, and it
+   **probes first**: `unshare --mount --pid --fork` and a writable
+   `cgroup.controllers`. Measured on the shared runner (pipeline 588, job 1586):
+   the probe fails in 0.4 s because the runner's pod has no `CAP_SYS_ADMIN`. So
+   the job is a tripwire that becomes a gate the day a privileged runner exists,
+   not a check that passes.
+   Two consequences to keep honest: the container-level claims in §2 rest on the
+   consumer's cluster test (a kubelet joining a throwaway control plane and
+   running pods under this runc), not on runc's own suite; and the job's
+   expected-failure step asserts that `TestInitJoinPID`,
+   `TestInitJoinNetworkAndUser`, `TestExecInUserns` and `TestExecInUsernsRlimit`
+   fail *and* report the documented refusal, so a limitation that quietly
+   disappears is noticed rather than counted as a pass.
+   *Would settle it:* a runner with `privileged: true` and a writable cgroupfs, or
+   the same tests cross-built and run inside the k4s node image, which boots as
+   root with `CAP_SYS_ADMIN`.
 
 ## 4. Not supported, with the kernel reason
 
@@ -454,6 +513,34 @@ does not have (`seccomp/differential_seccomp_test.go`, inside
 `TestAgainstLibseccomp`). A profile that lists an architecture without a table
 is still accepted; that architecture is refused instead of being silently
 unfiltered.
+
+### 4.5 Time namespaces
+
+Two things are refused, for the same reason: the offsets reach the kernel
+through the C constructor and nothing else.
+
+**Offsets are refused** (`purego_nocgo.go`, `checkPuregoConfig`, called from
+`factory_linux.go`, `Create`). `container_linux.go` puts them in the netlink
+payload (`TimeOffsetsAttr`, built when the time namespace is not being joined),
+and nsexec's stage 0 writes that payload to `/proc/<pid>/timens_offsets`
+(`nsexec.c`, `update_timens_offsets`). Under `puregoNamespaces` the payload is
+not built at all, while `Namespaces.CloneFlags()` still includes `CLONE_NEWTIME`,
+so `clone(2)` creates the namespace and the offsets are simply never applied: the
+container would see a zero offset and nothing would report it. Refusing is the
+fail-closed choice, and an **empty** map (`"timeOffsets": {}`) is not refused,
+because it asks for nothing.
+
+**Joining a time namespace by path is refused** (`join_namespaces_nocgo.go`):
+`timens_install` requires a single-threaded caller and returns `EUSERS`
+otherwise (`kernel/time/namespace.c`), and a Go process is never single-threaded.
+The same test already refuses the user namespace (`userns_install`,
+`kernel/user_namespace.c`).
+
+A future path exists that this port has not taken: the container init is itself
+created in the new time namespace by the parent's `clone(2)`, so it could write
+its own `/proc/self/timens_offsets` before `execve`. Nothing here does that, and
+whether it is safe against the container's own PID-namespace and mount state is
+untested.
 
 ## 5. Toolchain notes
 
