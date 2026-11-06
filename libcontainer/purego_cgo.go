@@ -5,6 +5,8 @@ package libcontainer
 import (
 	"os"
 	"os/exec"
+
+	"github.com/opencontainers/runc/libcontainer/configs"
 )
 
 // puregoNamespaces is false for the normal (cgo) build: the C constructor in
@@ -22,3 +24,7 @@ func setCloneFlags(cmd *exec.Cmd, flags uintptr) {}
 func stageExecNs(cmd *exec.Cmd, paths []string) (*os.File, *os.File, []string, error) {
 	return nil, nil, paths, nil
 }
+
+// checkPuregoConfig checks nothing for the cgo build: nsexec writes the offsets
+// into the bootstrap payload it reads before the namespace is entered.
+func checkPuregoConfig(_ *configs.Config) error { return nil }

@@ -118,3 +118,20 @@ func splitPidNamespacePath(paths []string) (rest []string, pidPath string) {
 	}
 	return rest, pidPath
 }
+
+// checkPuregoConfig refuses configuration this build cannot honour.
+//
+// The time-namespace offsets travel in the netlink bootstrap payload, which only
+// the C constructor reads, so the clone(2) that creates the namespace here makes
+// one with zero offsets and the container silently gets the host's clocks.
+// Silently is the problem: the caller asked for a shifted clock, and nothing in
+// the container would show that it did not get one.
+func checkPuregoConfig(config *configs.Config) error {
+	// len, not nil: specconv copies spec.Linux.TimeOffsets straight through, so a
+	// spec carrying "timeOffsets": {} arrives as an empty non-nil map and asks
+	// for nothing.
+	if len(config.TimeOffsets) > 0 {
+		return fmt.Errorf("timeOffsets cannot be applied without cgo: only the C namespace constructor reads them, so the time namespace would be created with none")
+	}
+	return nil
+}
