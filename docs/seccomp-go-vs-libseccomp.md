@@ -4,7 +4,7 @@
 
 # What the Go seccomp compiler does differently from libseccomp
 
-`libcontainer/seccomp` on the `purego-seccomp` branch of the runc fork compiles
+`libcontainer/seccomp` in the runc fork's `local-main` compiles
 a seccomp profile to classic BPF in Go, so runc can enforce a profile without
 cgo and without libseccomp. This document records what that compiler does
 *differently* from the libseccomp build, measured by installing both filters
@@ -645,13 +645,18 @@ curl -O https://archive.ubuntu.com/ubuntu/pool/main/l/linux/linux-image-unsigned
 dpkg-deb -x linux-image-unsigned-*.deb /tmp/kern
 ```
 
-To see the two compiled programs for the profiles above, on the host, with no
-filter installed:
+To see the two compiled programs side by side, on the host, with no filter
+installed, and to ask each build which architectures it will add:
 
 ```
-VMDIFF_DIAG=1 CGO_ENABLED=1 go test -tags seccomp -run TestVMDiffDumpPrograms -v ./libcontainer/seccomp/
-VMDIFF_DIAG=1 CGO_ENABLED=1 go test -tags seccomp -run TestVMDiffArchCompat -v ./libcontainer/seccomp/
+./libcontainer/seccomp/vmdiff/run.sh dump            # every case
+./libcontainer/seccomp/vmdiff/run.sh dump --arches
 ```
+
+`run.sh dump` builds both binaries with `-tags seccomp_diag`, has each one print
+the program it compiles, and diffs the two reports. The architecture list is a
+per-build question for the same reason: it is what that build compiles, so each
+side answers for itself.
 
 The fast tests, which need no VM and no kernel image. The first runs the pins
 for all seven root causes in the interpreter; the second adds the comparison
