@@ -94,7 +94,7 @@ libcontainer-integration:
     - |
       if ! unshare --mount --pid --fork true 2>/dev/null; then
         echo "this runner cannot create namespaces: the pod needs CAP_SYS_ADMIN (privileged: true)"
-        echo "see https://gitlab.corp.dxecleaner.org/k4s/runc/-/issues/4"
+        echo "the job comment above says why, and what the tests need"
         exit 1
       fi
       echo "namespaces: ok"

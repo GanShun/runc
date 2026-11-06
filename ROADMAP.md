@@ -468,9 +468,8 @@ init stage through `RuncNsCommand`, carry the init's clone flags onto its
 is applied, as `adoptRuncNsChild` does. Two things to get right: the
 parent-death signal under `CLONE_PARENT`, and the cgroup-namespace root on the
 path that does not use `CLONE_INTO_CGROUP`. Upstream's `TestInitJoinPID` is the
-acceptance test (it needs root). Tracked in
-<https://gitlab.corp.dxecleaner.org/k4s/runc/-/issues/1>, with a consumer-side
-check in <https://gitlab.corp.dxecleaner.org/k4s/k4s/-/issues/1>.
+acceptance test (it needs root). The consumer-side check belongs in k4s: a
+`shareProcessNamespace` pod in `make test-cluster`.
 
 ### 4.3 Checkpoint/restore (CRIU)
 
