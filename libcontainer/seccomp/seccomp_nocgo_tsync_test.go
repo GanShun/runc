@@ -9,6 +9,7 @@ import (
 	"runtime"
 	"strings"
 	"testing"
+	"unsafe"
 
 	"golang.org/x/sys/unix"
 
@@ -146,6 +147,18 @@ func runTsyncProbe(mode string) {
 		config.Syscalls = []*configs.Syscall{
 			{Name: "getppid", Action: configs.Notify},
 		}
+		// TSYNC_ESRCH arrived in 5.7. On an older kernel the pairing cannot be
+		// expressed at all, so this is an unavailable kernel feature rather than a
+		// defect: a raw probe of the flag decides, and says so.
+		prog := unix.SockFprog{Len: 1, Filter: &[]unix.SockFilter{
+			{Code: unix.BPF_RET | unix.BPF_K, K: unix.SECCOMP_RET_ALLOW},
+		}[0]}
+		if _, _, errno := unix.Syscall(unix.SYS_SECCOMP, unix.SECCOMP_SET_MODE_FILTER,
+			uintptr(unix.SECCOMP_FILTER_FLAG_TSYNC|unix.SECCOMP_FILTER_FLAG_TSYNC_ESRCH),
+			uintptr(unsafe.Pointer(&prog))); errno == unix.EINVAL {
+			fmt.Printf("tsync-esrch-unsupported\n")
+			os.Exit(0)
+		}
 	}
 	if _, err := InitSeccomp(config); err != nil {
 		fmt.Printf("install-failed: %v\n", err)
@@ -177,6 +190,9 @@ func TestTsyncWithNotifyLoads(t *testing.T) {
 	cmd.Env = append(os.Environ(), tsyncHelperEnv+"=tsync-notify")
 	out, err := cmd.CombinedOutput()
 	output := string(out)
+	if strings.Contains(output, "tsync-esrch-unsupported") {
+		t.Skip("this kernel predates SECCOMP_FILTER_FLAG_TSYNC_ESRCH; tsync + notify cannot be expressed")
+	}
 	if strings.Contains(output, "install-failed") {
 		// EPERM is the host refusing to install a filter at all; anything else is
 		// the defect this test exists for, and must not read as a skip.
