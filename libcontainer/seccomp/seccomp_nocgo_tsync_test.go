@@ -135,12 +135,26 @@ func runTsyncProbe(mode string) {
 			{Name: "getppid", Action: configs.Errno, ErrnoRet: &deny},
 		},
 	}
-	if mode == "tsync" {
+	if mode == "tsync" || mode == "tsync-notify" {
 		config.Flags = []specs.LinuxSeccompFlag{specs.LinuxSeccompFlag("SECCOMP_FILTER_FLAG_TSYNC")}
+	}
+	if mode == "tsync-notify" {
+		// TSYNC and NEW_LISTENER both return a value, so the kernel refuses the
+		// pair unless TSYNC_ESRCH says which one the caller wants. Nothing calls
+		// getppid here: a notify rule parks the caller until a supervisor
+		// answers, and this only has to load.
+		config.Syscalls = []*configs.Syscall{
+			{Name: "getppid", Action: configs.Notify},
+		}
 	}
 	if _, err := InitSeccomp(config); err != nil {
 		fmt.Printf("install-failed: %v\n", err)
 		os.Exit(2)
+	}
+
+	if mode == "tsync-notify" {
+		fmt.Printf("install-ok\n")
+		os.Exit(0)
 	}
 
 	close(start)
@@ -149,4 +163,32 @@ func runTsyncProbe(mode string) {
 	fmt.Printf("installer-thread: %d\n", installer)
 	fmt.Printf("other-thread: %d\n", other)
 	os.Exit(0)
+}
+
+// TestTsyncWithNotifyLoads is the pairing check against the kernel: a profile that
+// asks for tsync and has a notify rule must install. Without TSYNC_ESRCH the
+// kernel refuses it with EINVAL, so this is the regression test for that.
+func TestTsyncWithNotifyLoads(t *testing.T) {
+	if os.Getenv(tsyncHelperEnv) != "" {
+		t.Skip("child process")
+	}
+
+	cmd := exec.Command(os.Args[0], "-test.run=TestTsyncHelperProcess")
+	cmd.Env = append(os.Environ(), tsyncHelperEnv+"=tsync-notify")
+	out, err := cmd.CombinedOutput()
+	output := string(out)
+	if strings.Contains(output, "install-failed") {
+		// EPERM is the host refusing to install a filter at all; anything else is
+		// the defect this test exists for, and must not read as a skip.
+		if strings.Contains(output, "operation not permitted") {
+			t.Skipf("cannot install a seccomp filter on this host: %s", strings.TrimSpace(output))
+		}
+		t.Fatalf("tsync + notify did not load: %s", strings.TrimSpace(output))
+	}
+	if err != nil {
+		t.Fatalf("helper exited with %v; output:\n%s", err, out)
+	}
+	if !strings.Contains(output, "install-ok") {
+		t.Fatalf("expected install-ok in helper output, got:\n%s", out)
+	}
 }

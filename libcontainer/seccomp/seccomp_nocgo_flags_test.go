@@ -25,9 +25,12 @@ func TestFilterFlags(t *testing.T) {
 	}{
 		{name: "none", want: 0},
 		{
+			// TSYNC_ESRCH always travels with TSYNC: without it the kernel
+			// refuses TSYNC together with a listener, and reports a failed
+			// synchronisation as a positive tid rather than an errno.
 			name:  "tsync",
 			flags: []specs.LinuxSeccompFlag{flagTsync},
-			want:  unix.SECCOMP_FILTER_FLAG_TSYNC,
+			want:  unix.SECCOMP_FILTER_FLAG_TSYNC | unix.SECCOMP_FILTER_FLAG_TSYNC_ESRCH,
 		},
 		{
 			name:  "log",

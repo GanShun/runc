@@ -108,6 +108,15 @@ func filterFlags(config *configs.Seccomp) (uint, error) {
 			break
 		}
 	}
+
+	// TSYNC and NEW_LISTENER both return a value -- a thread id and a descriptor
+	// -- and seccomp_set_mode_filter refuses the pair with EINVAL unless
+	// TSYNC_ESRCH says the caller can tell them apart. It also changes a failed
+	// synchronisation from a positive tid, which a caller checking only errno
+	// reads as success, into a negative errno.
+	if flags&unix.SECCOMP_FILTER_FLAG_TSYNC != 0 {
+		flags |= unix.SECCOMP_FILTER_FLAG_TSYNC_ESRCH
+	}
 	return flags, nil
 }
 
@@ -118,7 +127,6 @@ func loadFilter(flags uint, filter []unix.SockFilter) (int, error) {
 		Len:    uint16(len(filter)),
 		Filter: &filter[0],
 	}
-	fd := -1 // only set when SECCOMP_FILTER_FLAG_NEW_LISTENER is used
 	if flags == 0 {
 		err := unix.Prctl(unix.PR_SET_SECCOMP,
 			unix.SECCOMP_MODE_FILTER,
@@ -126,21 +134,60 @@ func loadFilter(flags uint, filter []unix.SockFilter) (int, error) {
 		if err != nil {
 			return -1, fmt.Errorf("error loading seccomp filter: %w", err)
 		}
-	} else {
-		fdptr, _, errno := unix.RawSyscall(unix.SYS_SECCOMP,
-			uintptr(unix.SECCOMP_SET_MODE_FILTER),
-			uintptr(flags),
-			uintptr(unsafe.Pointer(&fprog)))
-		if errno != 0 {
-			return -1, fmt.Errorf("error loading seccomp filter: %w", errno)
-		}
-		if flags&unix.SECCOMP_FILTER_FLAG_NEW_LISTENER != 0 {
-			fd = int(fdptr)
-		}
+		runtime.KeepAlive(filter)
+		runtime.KeepAlive(fprog)
+		return -1, nil
+	}
+
+	ret, errno := seccompSetModeFilter(flags, &fprog)
+	// Kernels before 5.7 do not know TSYNC_ESRCH and reject the call outright.
+	// Without a listener the original call is still worth retrying: a failed
+	// synchronisation then shows up as a positive tid, which
+	// seccompFilterResult turns back into an error.
+	if errno == unix.EINVAL && flags&unix.SECCOMP_FILTER_FLAG_TSYNC_ESRCH != 0 &&
+		flags&unix.SECCOMP_FILTER_FLAG_NEW_LISTENER == 0 {
+		flags &^= unix.SECCOMP_FILTER_FLAG_TSYNC_ESRCH
+		ret, errno = seccompSetModeFilter(flags, &fprog)
+	}
+	if errno != 0 {
+		return -1, fmt.Errorf("error loading seccomp filter: %w", errno)
+	}
+
+	fd, err := seccompFilterResult(flags, ret)
+	if err != nil {
+		return -1, fmt.Errorf("error loading seccomp filter: %w", err)
 	}
 	runtime.KeepAlive(filter)
 	runtime.KeepAlive(fprog)
 	return fd, nil
+}
+
+// seccompSetModeFilter is the seccomp(2) call itself, kept apart so that
+// loadFilter can retry it with a different flag set.
+func seccompSetModeFilter(flags uint, fprog *unix.SockFprog) (uintptr, unix.Errno) {
+	ret, _, errno := unix.RawSyscall(unix.SYS_SECCOMP,
+		uintptr(unix.SECCOMP_SET_MODE_FILTER),
+		uintptr(flags),
+		uintptr(unsafe.Pointer(fprog)))
+	return ret, errno
+}
+
+// seccompFilterResult interprets what seccomp(2) returned.
+//
+// With NEW_LISTENER the value is the notification descriptor. Otherwise the call
+// returns 0, or -- when TSYNC is set and the kernel has no TSYNC_ESRCH to report
+// failures through -- the tid of a thread it could not filter: a positive value
+// with errno 0, because the kernel does not consider it an error. Reading only
+// errno there reports success while that thread runs unfiltered, which is the
+// opposite of what a profile asking for tsync is for.
+func seccompFilterResult(flags uint, ret uintptr) (fd int, err error) {
+	if flags&unix.SECCOMP_FILTER_FLAG_NEW_LISTENER != 0 {
+		return int(ret), nil
+	}
+	if flags&unix.SECCOMP_FILTER_FLAG_TSYNC != 0 && ret != 0 {
+		return -1, fmt.Errorf("filter was not applied to thread %d: %w", int64(ret), unix.ESRCH)
+	}
+	return -1, nil
 }
 
 // FlagSupported checks if the flag is known to runc. Unlike the libseccomp
