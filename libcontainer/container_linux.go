@@ -562,7 +562,16 @@ func (c *Container) newParentProcess(p *Process) (parentProcess, error) {
 	if cmd.SysProcAttr == nil {
 		cmd.SysProcAttr = &unix.SysProcAttr{}
 	}
-	setCloneFlags(cmd, c.config.Namespaces.CloneFlags())
+	// Only the container's own init is cloned into fresh namespaces. An exec
+	// child joins the container's by setns, and setCloneFlags is a no-op in
+	// the cgo build anyway; without cgo, CloneFlags() is a flag for every
+	// private namespace the container has, so applying it to an exec child
+	// would give it brand-new net/ipc/uts/mnt/cgroup namespaces -- and a
+	// brand-new PID namespace of its own, which the container knows nothing
+	// about. See setCloneFlags.
+	if p.Init {
+		setCloneFlags(cmd, c.config.Namespaces.CloneFlags())
+	}
 	cmd.Env = append(cmd.Env, "GOMAXPROCS="+os.Getenv("GOMAXPROCS"))
 	cmd.ExtraFiles = append(cmd.ExtraFiles, p.ExtraFiles...)
 	if p.ConsoleSocket != nil {
@@ -651,7 +660,26 @@ func (c *Container) newInitProcess(p *Process, cmd *exec.Cmd, comm *processComm)
 			nsMaps[ns.Type] = ns.Path
 		}
 	}
-	data, err := c.bootstrapData(c.config.Namespaces.CloneFlags(), nsMaps)
+	// The netlink bootstrap message is what the C constructor reads, and the
+	// constructor does not exist without cgo; initProcess.start only copies the
+	// message in the cgo build. Not building it keeps a payload that can never
+	// be read out of the nocgo path entirely.
+	var (
+		data io.Reader
+		err  error
+	)
+	if !puregoNamespaces {
+		data, err = c.bootstrapData(c.config.Namespaces.CloneFlags(), nsMaps)
+		if err != nil {
+			return nil, err
+		}
+	}
+	config := c.newInitConfig(p)
+	// The namespaces given by path do not contribute clone flags (see
+	// CloneFlags), so the child has to join them itself; this is where it is
+	// told which. Without cgo that is the only way they are communicated at
+	// all, since the bootstrap message above goes to the C constructor.
+	config.NamespacePaths, err = c.orderNamespacePaths(nsMaps)
 	if err != nil {
 		return nil, err
 	}
@@ -661,7 +689,7 @@ func (c *Container) newInitProcess(p *Process, cmd *exec.Cmd, comm *processComm)
 			cmd:           cmd,
 			comm:          comm,
 			manager:       c.cgroupManager,
-			config:        c.newInitConfig(p),
+			config:        config,
 			process:       p,
 			bootstrapData: data,
 			container:     c,
@@ -677,16 +705,42 @@ func (c *Container) newSetnsProcess(p *Process, cmd *exec.Cmd, comm *processComm
 	state := c.currentState()
 	// for setns process, we don't have to set cloneflags as the process namespaces
 	// will only be set via setns syscall
-	data, err := c.bootstrapData(0, state.NamespacePaths)
+	//
+	// The bootstrap message is read by the C constructor, which does not exist
+	// without cgo; setnsProcess.start only copies it in the cgo build. Not
+	// building it keeps a payload that can never be read out of the nocgo path
+	// entirely.
+	var (
+		data io.Reader
+		err  error
+	)
+	if !puregoNamespaces {
+		data, err = c.bootstrapData(0, state.NamespacePaths)
+		if err != nil {
+			return nil, err
+		}
+	}
+	config := c.newInitConfig(p)
+	config.NamespacePaths, err = c.orderNamespacePaths(state.NamespacePaths)
 	if err != nil {
 		return nil, err
 	}
+	// Stage this exec into the container's PID namespace. Without cgo there is
+	// no other way to create a process there (see stageExecNs); with cgo this
+	// is a no-op, because nsexec's stage 1 already joins every namespace and
+	// forks stage 2 into the PID namespace.
+	reportParent, reportChild, rest, err := stageExecNs(cmd, config.NamespacePaths)
+	if err != nil {
+		return nil, err
+	}
+	config.NamespacePaths = rest
+
 	proc := &setnsProcess{
 		containerProcess: containerProcess{
 			cmd:           cmd,
 			comm:          comm,
 			manager:       c.cgroupManager,
-			config:        c.newInitConfig(p),
+			config:        config,
 			process:       p,
 			bootstrapData: data,
 			container:     c,
@@ -694,6 +748,8 @@ func (c *Container) newSetnsProcess(p *Process, cmd *exec.Cmd, comm *processComm
 		rootlessCgroups: c.config.RootlessCgroups,
 		intelRdtPath:    state.IntelRdtPath,
 		initProcessPid:  state.InitProcessPid,
+		pidReport:       reportParent,
+		pidReportChild:  reportChild,
 	}
 	return proc, nil
 }
