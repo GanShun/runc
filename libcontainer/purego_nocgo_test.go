@@ -93,7 +93,9 @@ func TestStageExecNsWiresStage(t *testing.T) {
 	if idx := len(cmd.ExtraFiles) - 2; cmd.ExtraFiles[idx] != safeExe {
 		t.Errorf("ExtraFiles[%d] is not safeExe, so %q names the wrong descriptor", idx, cmd.Path)
 	}
-	wantArgs := []string{sealed, RuncNsCommand, "/proc/42/ns/pid", sealed, "runc-own-argv0", "init"}
+	// argv[0] is runc's own so an operator sees "runc runcns ..." in ps; the
+	// executable is still the sealed path, and that is the assertion above.
+	wantArgs := []string{"runc-own-argv0", RuncNsCommand, "/proc/42/ns/pid", sealed, "runc-own-argv0", "init"}
 	if !reflect.DeepEqual(cmd.Args, wantArgs) {
 		t.Errorf("cmd.Args = %v, want %v", cmd.Args, wantArgs)
 	}

@@ -97,9 +97,13 @@ func stageExecNs(cmd *exec.Cmd, paths []string) (reportParent, reportChild *os.F
 	// The path stays valid across this one extra exec: safeExe is in ExtraFiles,
 	// so it is not close-on-exec, and its number does not change when the report
 	// pipe is appended after it.
+	//
+	// argv[0] is runc's own, not the descriptor path: dispatch reads os.Args[1],
+	// so the name is only what an operator sees in ps, and "/proc/self/fd/3
+	// runcns ..." says less about what is running than "runc runcns ..." does.
 	initExe := cmd.Path
 	runcArgv0 := cmd.Args[0]
-	cmd.Args = append([]string{initExe, RuncNsCommand, pidPath, initExe, runcArgv0}, cmd.Args[1:]...)
+	cmd.Args = append([]string{runcArgv0, RuncNsCommand, pidPath, initExe, runcArgv0}, cmd.Args[1:]...)
 	cmd.Path = initExe
 
 	return reportParent, reportChild, rest, nil
