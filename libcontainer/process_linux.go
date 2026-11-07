@@ -510,7 +510,7 @@ func (p *setnsProcess) start() (retErr error) {
 	// because the message goes to the sync socket, not to stderr.
 	// initProcess.start has had this guard since the fork's first commit; the
 	// setns path was not ported with it.
-	if !puregoNamespaces && p.bootstrapData != nil {
+	if !parentCreatesNamespaces && p.bootstrapData != nil {
 		if _, err := io.Copy(p.comm.initSockParent, p.bootstrapData); err != nil {
 			return fmt.Errorf("error copying bootstrap data to pipe: %w", err)
 		}
@@ -525,7 +525,7 @@ func (p *setnsProcess) start() (retErr error) {
 	if err := p.setFinalCPUAffinity(); err != nil {
 		return err
 	}
-	if puregoNamespaces {
+	if parentCreatesNamespaces {
 		// Only now is p.pid() the exec'd process rather than the stage that
 		// created it; writing before execSetns would adjust the wrong one.
 		if err := applyOomScoreAdj(p.pid(), p.config.Config.OomScoreAdj); err != nil {
@@ -642,7 +642,7 @@ func (p *setnsProcess) execSetns() error {
 	if p.pidReport != nil {
 		return p.adoptRuncNsChild()
 	}
-	if puregoNamespaces {
+	if parentCreatesNamespaces {
 		// No C stage and no RuncNsCommand stage -- stageExecNs only sets one up
 		// when the container's config has a PID namespace for the init stage to
 		// be placed in, which one built without one does not -- so the direct
@@ -1100,7 +1100,7 @@ func (p *initProcess) start() (retErr error) {
 	// Reset the CPU affinity after cgroups are configured to make sure it
 	// matches any configured cpuset.
 	tryResetCPUAffinity(p.pid())
-	if puregoNamespaces {
+	if parentCreatesNamespaces {
 		if err := applyOomScoreAdj(p.pid(), p.config.Config.OomScoreAdj); err != nil {
 			return err
 		}
@@ -1111,7 +1111,7 @@ func (p *initProcess) start() (retErr error) {
 		}
 	}
 	var childPid int
-	if puregoNamespaces {
+	if parentCreatesNamespaces {
 		// No C stage: the direct child is the container init (a single
 		// clone created the namespaces), so its PID is the one we want.
 		childPid = p.cmd.Process.Pid
@@ -1134,7 +1134,7 @@ func (p *initProcess) start() (retErr error) {
 	}
 	p.setExternalDescriptors(fds)
 
-	if !puregoNamespaces {
+	if !parentCreatesNamespaces {
 		// Wait for our first child to exit
 		if err := p.waitForChildExit(childPid); err != nil {
 			return fmt.Errorf("error waiting for our first child to exit: %w", err)

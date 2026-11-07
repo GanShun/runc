@@ -12,10 +12,10 @@ import (
 	"github.com/opencontainers/runc/libcontainer/configs"
 )
 
-// TestCheckPuregoConfigRefusesTimeOffsets covers the one config field the cgo-free
+// TestCheckNocgoConfigRefusesTimeOffsets covers the one config field the cgo-free
 // path cannot honour. The offsets are read only by the C constructor, so the
 // clone(2) here would create a time namespace with none and nothing would say so.
-func TestCheckPuregoConfigRefusesTimeOffsets(t *testing.T) {
+func TestCheckNocgoConfigRefusesTimeOffsets(t *testing.T) {
 	config := &configs.Config{
 		Rootfs:     t.TempDir(),
 		Namespaces: configs.Namespaces([]configs.Namespace{{Type: configs.NEWNS}, {Type: configs.NEWTIME}}),
@@ -23,21 +23,21 @@ func TestCheckPuregoConfigRefusesTimeOffsets(t *testing.T) {
 			"monotonic": {Secs: 3600},
 		},
 	}
-	err := checkPuregoConfig(config)
+	err := checkNocgoConfig(config)
 	if err == nil {
-		t.Fatal("checkPuregoConfig allowed timeOffsets, want a refusal")
+		t.Fatal("checkNocgoConfig allowed timeOffsets, want a refusal")
 	}
 	if !strings.Contains(err.Error(), "timeOffsets cannot be applied without cgo") {
 		t.Errorf("err = %q, want it to name the field and the reason", err)
 	}
 
-	if err := checkPuregoConfig(&configs.Config{}); err != nil {
-		t.Errorf("checkPuregoConfig refused a config without offsets: %v", err)
+	if err := checkNocgoConfig(&configs.Config{}); err != nil {
+		t.Errorf("checkNocgoConfig refused a config without offsets: %v", err)
 	}
 	// An empty map asks for nothing; specconv passes a spec's empty
 	// "timeOffsets": {} through as exactly this.
-	if err := checkPuregoConfig(&configs.Config{TimeOffsets: map[string]specs.LinuxTimeOffset{}}); err != nil {
-		t.Errorf("checkPuregoConfig refused an empty offset map: %v", err)
+	if err := checkNocgoConfig(&configs.Config{TimeOffsets: map[string]specs.LinuxTimeOffset{}}); err != nil {
+		t.Errorf("checkNocgoConfig refused an empty offset map: %v", err)
 	}
 
 	// And through Create, which is the call the caller actually makes. The
@@ -51,14 +51,14 @@ func TestCheckPuregoConfigRefusesTimeOffsets(t *testing.T) {
 	}
 }
 
-// TestCheckPuregoConfigRefusesParentDeathSignal covers the configuration that
+// TestCheckNocgoConfigRefusesParentDeathSignal covers the configuration that
 // cannot be honoured rather than the one that is merely unimplemented: the init is
 // cloned with CLONE_PARENT, so its real parent is the runc thread that forked the
 // stage, and arming PR_SET_PDEATHSIG against that thread kills a container whose
 // runc is still alive the moment Go retires the thread.
-func TestCheckPuregoConfigRefusesParentDeathSignal(t *testing.T) {
+func TestCheckNocgoConfigRefusesParentDeathSignal(t *testing.T) {
 	config := &configs.Config{ParentDeathSignal: int(unix.SIGKILL)}
-	err := checkPuregoConfig(config)
+	err := checkNocgoConfig(config)
 	if err == nil {
 		t.Fatal("expected ParentDeathSignal to be refused")
 	}

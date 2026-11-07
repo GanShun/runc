@@ -14,10 +14,10 @@ import (
 	"github.com/opencontainers/runc/libcontainer/configs"
 )
 
-// puregoNamespaces is true when runc is built without cgo. In that build the C
+// parentCreatesNamespaces is true when runc is built without cgo. In that build the C
 // namespace constructor (libcontainer/nsenter) does not exist, so the
 // namespaces are created by the Go runtime's clone(2) support in exec.Cmd.
-const puregoNamespaces = true
+const parentCreatesNamespaces = true
 
 // setCloneFlags asks the kernel to create the container's namespaces directly
 // when the init process is cloned. This replaces what nsexec.c does before the
@@ -80,7 +80,7 @@ func stageExecNs(cmd *exec.Cmd, paths []string) (reportParent, reportChild *os.F
 // The parent-death signal is the exception: it is *not* passed down, because Go's
 // fork code kills a child whose getppid() differs from the forking process's pid and
 // CLONE_PARENT makes that always true. A config that asks for one is refused before
-// it gets this far (checkPuregoConfig); stagedSysProcAttr has the whole of it.
+// it gets this far (checkNocgoConfig); stagedSysProcAttr has the whole of it.
 func stageInitNs(cmd *exec.Cmd, paths []string, cloneFlags uintptr) (reportParent, reportChild *os.File, rest []string, err error) {
 	return stageNs(cmd, paths, cloneFlags)
 }
@@ -105,7 +105,7 @@ func stageNs(cmd *exec.Cmd, paths []string, cloneFlags uintptr) (reportParent, r
 		}
 		// The stage is runc's direct child, so a parent-death signal on it would
 		// work -- and be pointless, since it exits immediately. Nothing else arms
-		// one either: checkPuregoConfig refuses the config that asks for it.
+		// one either: checkNocgoConfig refuses the config that asks for it.
 		cmd.SysProcAttr.Pdeathsig = 0
 	}
 	if cloneFlags != 0 {
@@ -167,7 +167,7 @@ func splitPidNamespacePath(paths []string) (rest []string, pidPath string) {
 	return rest, pidPath
 }
 
-// checkPuregoConfig refuses configuration this build cannot honour.
+// checkNocgoConfig refuses configuration this build cannot honour.
 //
 // The time-namespace offsets travel in the netlink bootstrap payload, which only
 // the C constructor reads, so the clone(2) that creates the namespace here makes
@@ -182,7 +182,7 @@ func splitPidNamespacePath(paths []string) (rest []string, pidPath string) {
 // (golang/go#27505). Upstream runc honours the field anyway; this build refuses
 // it rather than deliver a signal that means something other than the caller
 // asked for.
-func checkPuregoConfig(config *configs.Config) error {
+func checkNocgoConfig(config *configs.Config) error {
 	if config.ParentDeathSignal > 0 {
 		return fmt.Errorf("ParentDeathSignal cannot be honoured without cgo: the container's parent is a runc thread, which the Go runtime may retire at any time (golang/go#27505)")
 	}

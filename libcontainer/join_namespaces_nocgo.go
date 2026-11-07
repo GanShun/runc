@@ -54,7 +54,7 @@ import (
 //     nsexec forks and lets the child be created there. A raw fork that carries
 //     on running Go is not available, but a fork that re-execs is: RuncNsCommand,
 //     which arms pid_ns_for_children and then starts the init stage with
-//     os/exec (see stageExecNs in purego_nocgo.go). An exec therefore never
+//     os/exec (see stageExecNs in namespaces_nocgo.go). An exec therefore never
 //     reaches this branch with a PID path: the path is handed to that stage
 //     and taken out of the list below.
 //

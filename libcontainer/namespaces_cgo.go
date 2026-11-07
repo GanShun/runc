@@ -9,10 +9,10 @@ import (
 	"github.com/opencontainers/runc/libcontainer/configs"
 )
 
-// puregoNamespaces is false for the normal (cgo) build: the C constructor in
+// parentCreatesNamespaces is false for the normal (cgo) build: the C constructor in
 // libcontainer/nsenter creates the namespaces before the Go runtime starts,
 // and reports the final child PID over the init pipe.
-const puregoNamespaces = false
+const parentCreatesNamespaces = false
 
 // setCloneFlags is a no-op for the cgo build; the C constructor owns this.
 func setCloneFlags(cmd *exec.Cmd, flags uintptr) {}
@@ -31,6 +31,6 @@ func stageInitNs(cmd *exec.Cmd, paths []string, _ uintptr) (*os.File, *os.File, 
 	return nil, nil, paths, nil
 }
 
-// checkPuregoConfig checks nothing for the cgo build: nsexec writes the offsets
+// checkNocgoConfig checks nothing for the cgo build: nsexec writes the offsets
 // into the bootstrap payload it reads before the namespace is entered.
-func checkPuregoConfig(_ *configs.Config) error { return nil }
+func checkNocgoConfig(_ *configs.Config) error { return nil }

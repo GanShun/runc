@@ -124,16 +124,16 @@ func TestStageExecNsWiresStage(t *testing.T) {
 	}
 }
 
-// puregoHelperEnv selects the child role in TestPuregoNocgoHelperProcess.
-const puregoHelperEnv = "RUNC_PUREGO_TEST_ROLE"
+// nocgoHelperEnv selects the child role in TestNocgoHelperProcess.
+const nocgoHelperEnv = "RUNC_NOCGO_TEST_ROLE"
 
-// puregoArgvEnv names the file the "argv" role writes its own argv to.
-const puregoArgvEnv = "RUNC_PUREGO_TEST_ARGV_FILE"
+// nocgoArgvEnv names the file the "argv" role writes its own argv to.
+const nocgoArgvEnv = "RUNC_NOCGO_TEST_ARGV_FILE"
 
-// TestPuregoNocgoHelperProcess is the child half of the adoption tests below.
+// TestNocgoHelperProcess is the child half of the adoption tests below.
 // It is not a real test and does nothing unless the environment selects a role.
-func TestPuregoNocgoHelperProcess(t *testing.T) {
-	switch os.Getenv(puregoHelperEnv) {
+func TestNocgoHelperProcess(t *testing.T) {
+	switch os.Getenv(nocgoHelperEnv) {
 	case "":
 		return
 	case "exit":
@@ -145,7 +145,7 @@ func TestPuregoNocgoHelperProcess(t *testing.T) {
 		// os.Args as this process sees it: the stage passes the caller's argv0
 		// as this process's argv[0], not the path it was exec'd from.
 		body := strings.Join(os.Args, "\n") + "\n"
-		if err := os.WriteFile(os.Getenv(puregoArgvEnv), []byte(body), 0o600); err != nil {
+		if err := os.WriteFile(os.Getenv(nocgoArgvEnv), []byte(body), 0o600); err != nil {
 			fmt.Fprintln(os.Stderr, err)
 			os.Exit(1)
 		}
@@ -153,11 +153,11 @@ func TestPuregoNocgoHelperProcess(t *testing.T) {
 	}
 }
 
-// startPuregoHelper starts a copy of the test binary in one of the roles above.
-func startPuregoHelper(t *testing.T, role string) *exec.Cmd {
+// startNocgoHelper starts a copy of the test binary in one of the roles above.
+func startNocgoHelper(t *testing.T, role string) *exec.Cmd {
 	t.Helper()
-	cmd := exec.Command(os.Args[0], "-test.run=TestPuregoNocgoHelperProcess")
-	cmd.Env = append(os.Environ(), puregoHelperEnv+"="+role)
+	cmd := exec.Command(os.Args[0], "-test.run=TestNocgoHelperProcess")
+	cmd.Env = append(os.Environ(), nocgoHelperEnv+"="+role)
 	if err := cmd.Start(); err != nil {
 		t.Fatalf("start helper (%s): %v", role, err)
 	}
@@ -192,8 +192,8 @@ func ppidOf(t *testing.T, pid int) int {
 // (CLONE_PARENT), which is what makes the reported pid one runc can reap.
 func TestStartExecNsStageStartsCallerParentedChild(t *testing.T) {
 	argvFile := filepath.Join(t.TempDir(), "argv")
-	t.Setenv(puregoHelperEnv, "argv")
-	t.Setenv(puregoArgvEnv, argvFile)
+	t.Setenv(nocgoHelperEnv, "argv")
+	t.Setenv(nocgoArgvEnv, argvFile)
 
 	reportParent, reportChild, err := os.Pipe()
 	if err != nil {
@@ -203,7 +203,7 @@ func TestStartExecNsStageStartsCallerParentedChild(t *testing.T) {
 
 	// argv is exactly the layout stageExecNs builds and the stage's runRuncNs
 	// takes as its args[1:]: program, argv0, then the program's own arguments.
-	argv := []string{os.Args[0], "runc-argv0", "-test.run=TestPuregoNocgoHelperProcess"}
+	argv := []string{os.Args[0], "runc-argv0", "-test.run=TestNocgoHelperProcess"}
 	if err := startExecNsStage(argv, int(reportChild.Fd()), 0); err != nil {
 		t.Fatalf("startExecNsStage: %v", err)
 	}
@@ -239,7 +239,7 @@ func TestStartExecNsStageStartsCallerParentedChild(t *testing.T) {
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	want := "runc-argv0\n-test.run=TestPuregoNocgoHelperProcess\n"
+	want := "runc-argv0\n-test.run=TestNocgoHelperProcess\n"
 	if string(body) != want {
 		t.Errorf("child argv = %q, want %q", body, want)
 	}
@@ -264,13 +264,13 @@ func assertProcessDies(t *testing.T, cmd *exec.Cmd) {
 
 // TestAdoptRuncNsChild adopts a reported pid on the normal path.
 func TestAdoptRuncNsChildAdoptsReportedPid(t *testing.T) {
-	helper := startPuregoHelper(t, "exit")
+	helper := startNocgoHelper(t, "exit")
 	defer func() {
 		_ = helper.Process.Kill()
 		_, _ = helper.Process.Wait()
 	}()
 
-	target := startPuregoHelper(t, "block")
+	target := startNocgoHelper(t, "block")
 	defer func() {
 		_ = target.Process.Kill()
 		_, _ = target.Process.Wait()
@@ -305,7 +305,7 @@ func TestAdoptRuncNsChildAdoptsReportedPid(t *testing.T) {
 func TestAdoptRuncNsChildRefusesNonPositivePid(t *testing.T) {
 	for _, pid := range []string{"0", "-1"} {
 		t.Run(pid, func(t *testing.T) {
-			helper := startPuregoHelper(t, "exit")
+			helper := startNocgoHelper(t, "exit")
 			defer func() {
 				_ = helper.Process.Kill()
 				_, _ = helper.Process.Wait()
@@ -334,13 +334,13 @@ func TestAdoptRuncNsChildRefusesNonPositivePid(t *testing.T) {
 // in the report-error paths: the helper has already created the exec'd process,
 // so a report that cannot be adopted must still take that process down.
 func TestAdoptRuncNsChildKillsUnadoptedProcess(t *testing.T) {
-	helper := startPuregoHelper(t, "exit")
+	helper := startNocgoHelper(t, "exit")
 	defer func() {
 		_ = helper.Process.Kill()
 		_, _ = helper.Process.Wait()
 	}()
 
-	target := startPuregoHelper(t, "block")
+	target := startNocgoHelper(t, "block")
 	defer func() {
 		_ = target.Process.Kill()
 		_, _ = target.Process.Wait()
@@ -481,13 +481,13 @@ func TestReportFailureUsesTheReportDescriptor(t *testing.T) {
 // a WNOHANG wait reaps nothing and the zombie the branch exists to prevent
 // survives.
 func TestAdoptRuncNsChildReapsAFailedHandover(t *testing.T) {
-	helper := startPuregoHelper(t, "exit")
+	helper := startNocgoHelper(t, "exit")
 	defer func() {
 		_ = helper.Process.Kill()
 		_, _ = helper.Process.Wait()
 	}()
 
-	target := startPuregoHelper(t, "block")
+	target := startNocgoHelper(t, "block")
 	targetPid := target.Process.Pid
 
 	reportParent, reportChild, err := os.Pipe()
@@ -599,7 +599,7 @@ func TestStageInitNsWiresStage(t *testing.T) {
 		t.Errorf("the stage was told to arm a parent-death signal, which kills the child before execve:\n%s", env)
 	}
 	if cmd.SysProcAttr.Pdeathsig != 0 {
-		t.Errorf("stage Pdeathsig = %v, want 0: checkPuregoConfig refuses the field instead", cmd.SysProcAttr.Pdeathsig)
+		t.Errorf("stage Pdeathsig = %v, want 0: checkNocgoConfig refuses the field instead", cmd.SysProcAttr.Pdeathsig)
 	}
 
 	// The report pipe is appended last so that every descriptor number computed

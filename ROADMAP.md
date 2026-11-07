@@ -62,16 +62,16 @@ performed by the parent, or a re-exec of the same binary.
 
 **Verified in code:**
 
-- `purego_nocgo.go`: the `puregoNamespaces` constant and `setCloneFlags`, which
+- `namespaces_nocgo.go`: the `parentCreatesNamespaces` constant and `setCloneFlags`, which
   assigns `cmd.SysProcAttr.Cloneflags`, with the cgo counterpart a no-op in
-  `purego_cgo.go`.
+  `namespaces_cgo.go`.
 - Call site: `container_linux.go`, in `newParentProcess`, guarded by `if p.Init`.
 - Because the direct child *is* the container init, the parent takes its PID
   directly and never waits for a reported one: `process_linux.go`, in
   `initProcess.start`, which also skips `waitForChildExit`; the cgo path in the
   same function is unchanged.
 - The netlink bootstrap payload, which only the C constructor could read, is
-  built under `!puregoNamespaces` only (`container_linux.go`, in
+  built under `!parentCreatesNamespaces` only (`container_linux.go`, in
   `newInitProcess`).
 
 **Observed running:** the commit that introduced it (`libcontainer: create
@@ -119,7 +119,7 @@ running in the host's namespaces while everything above it believed otherwise
 namespace's), with the same assertion after a reboot. Not repeated here.
 
 **Untested:** the join itself has no unit test, and cannot have an
-unprivileged one — it needs a real `setns(2)`. `purego_nocgo_test.go` says so;
+unprivileged one — it needs a real `setns(2)`. `namespaces_nocgo_test.go` says so;
 the wiring around it is what is unit-tested, in `TestSplitPidNamespacePath` and
 `TestStageExecNsWiresStage`.
 
@@ -196,7 +196,7 @@ nothing has to survive the fork.
   returns); `runRuncNs` (`LockOSThread`, open the path, `setns(CLONE_NEWPID)`);
   `startExecNsStage` (start the next stage with `Cloneflags: CLONE_PARENT`,
   report the PID, `CloseOnExec` on the report fd).
-- The parent: `purego_nocgo.go`, `stageExecNs`, rewrites the exec command into
+- The parent: `namespaces_nocgo.go`, `stageExecNs`, rewrites the exec command into
   `<cmd.Path> runcns <pid-ns-path> <init-path> <runc argv0> init …`, appends one
   report pipe to `cmd.ExtraFiles` and removes the PID path from the list the init
   stage will join (`splitPidNamespacePath`); `container_linux.go`,
@@ -262,7 +262,7 @@ CGO_ENABLED=0 go test ./libcontainer/ -count=1
 # TestStartExecNsStageStartsCallerParentedChild,
 # TestAdoptRuncNsChildAdoptsReportedPid,
 # TestAdoptRuncNsChildRefusesNonPositivePid,
-# TestAdoptRuncNsChildKillsUnadoptedProcess   (purego_nocgo_test.go)
+# TestAdoptRuncNsChildKillsUnadoptedProcess   (namespaces_nocgo_test.go)
 ```
 
 They cover the argument, descriptor and report-pipe conventions and the
@@ -274,7 +274,7 @@ They cover the argument, descriptor and report-pipe conventions and the
 `/proc/<pid>/oom_score_adj` — called from `initProcess.start` after the cgroup
 apply, and from `setnsProcess.start` only after `execSetns`, since until the
 `runcns` stage has reported, `p.pid()` is the stage and not the exec'd process.
-Both are gated on `puregoNamespaces`; the cgo build keeps its single write, which
+Both are gated on `parentCreatesNamespaces`; the cgo build keeps its single write, which
 nsexec's stage 0 performs from inside the container (`nsexec.c`,
 `update_oom_score_adj`, writing `/proc/self/oom_score_adj`).
 
@@ -308,7 +308,7 @@ command or assertion that would close it.
    `runner.run`), `--preserve-fds` (`exec.go`, `execCommand`), a console socket
    (`exec.go`, `execCommand`, wired into `cmd.ExtraFiles` in
    `container_linux.go`, `newParentProcess`), a non-zero exit status coming back
-   out, and the **no-PID-namespace branch** (`purego_nocgo.go`, `stageExecNs`,
+   out, and the **no-PID-namespace branch** (`namespaces_nocgo.go`, `stageExecNs`,
    returns no stage at all; `process_linux.go`, `setnsProcess.execSetns`, takes
    the direct-child model instead — a hand-written bundle is the only way to
    reach it, since a CRI container always has a PID namespace).
@@ -321,7 +321,7 @@ command or assertion that would close it.
 2. **Descriptor pass-through across the extra stage — the most likely remaining
    bug.** The staging inserts a process into runc's fd inheritance chain: every
    `_LIBCONTAINER_*` descriptor and every preserved fd now has to survive one
-   more `execve` (`purego_nocgo.go`, `stageExecNs`; `runcns_linux.go`,
+   more `execve` (`namespaces_nocgo.go`, `stageExecNs`; `runcns_linux.go`,
    `startExecNsStage`). Nothing is re-plumbed and the numbers are meant to be
    unchanged, but the in-guest evidence is a hook that uses no extra
    descriptors.
@@ -333,7 +333,7 @@ command or assertion that would close it.
 3. **`runc exec` when runc's own executable is a `memfd:` clone.** This was a
    hazard in `stageExecNs`, which located the stage with `os.Executable()` while
    runc's own `/proc/self/exe` was a sealed memfd; the code now execs the stage
-   by the path `newParentProcess` built (`purego_nocgo.go`, `stageExecNs`, and
+   by the path `newParentProcess` built (`namespaces_nocgo.go`, `stageExecNs`, and
    §2.4), so the hazard is closed by construction and
    `TestStageExecNsWiresStage` asserts the wiring — the sealed path, and the
    descriptor numbering in `cmd.ExtraFiles` that keeps it valid across the extra
@@ -368,7 +368,7 @@ command or assertion that would close it.
 
 5. **`ParentDeathSignal` is refused, and the reason is measured.** Every
    cgo-free container is affected, not only one whose init carries a stage --
-   `checkPuregoConfig` is reached from `factory_linux.go`, `Create`. The signal
+   `checkNocgoConfig` is reached from `factory_linux.go`, `Create`. The signal
    follows the thread that forked the child: Go forks it from whichever runc
    thread called `cmd.Start()` and `PR_SET_PDEATHSIG` is delivered when that
    *task* exits, which the Go runtime may do at any time (golang/go#27505). A
@@ -394,7 +394,7 @@ command or assertion that would close it.
    Upstream runc honours the field despite the same threading behaviour, so this
    is deliberately stricter: a signal that arrives at an unrelated moment is worse
    than a refusal that names the field.
-   `TestCheckPuregoConfigRefusesParentDeathSignal` and
+   `TestCheckNocgoConfigRefusesParentDeathSignal` and
    `TestStagedSysProcAttrNeverArmsPdeathsig` are the guards. *Observed running:*
    the refusal and the probe; the cgo build's own arrangement is unchanged and was
    not re-measured.
@@ -493,7 +493,7 @@ says why rather than the kernel's `EINVAL`/"too many users", which does not.
 `CLONE_NEWUSER` plus the other namespaces returns `EPERM`, which is the ordering
 nsexec works around by unsharing the user namespace first, letting the parent
 write `uid_map`/`gid_map`, and unsharing the rest afterwards. That staging does
-not exist in Go here (`purego_nocgo.go`, `setCloneFlags`). `SysProcAttr` does
+not exist in Go here (`namespaces_nocgo.go`, `setCloneFlags`). `SysProcAttr` does
 support `UidMappings`/`GidMappings`; the staged unshare is the missing piece.
 Rootful containers, which is what this port is for, are unaffected.
 
@@ -520,7 +520,7 @@ container's init owns its private namespaces, and the stage's clone *is* the
 container's fork: the init's clone flags and its parent-death signal move off
 `cmd.SysProcAttr` and onto that clone, carried in
 `_LIBCONTAINER_RUNCNS_CLONEFLAGS` and `_LIBCONTAINER_RUNCNS_PDEATHSIG`
-(`purego_nocgo.go`, `stageInitNs`; `runcns_linux.go`, `stageCloneAttrs`). The
+(`namespaces_nocgo.go`, `stageInitNs`; `runcns_linux.go`, `stageCloneAttrs`). The
 stage itself keeps runc's namespaces, which is what makes the target reachable: it
 cannot `setns` into a PID namespace it is also creating.
 
@@ -597,11 +597,11 @@ unfiltered.
 Two things are refused, for the same reason: the offsets reach the kernel
 through the C constructor and nothing else.
 
-**Offsets are refused** (`purego_nocgo.go`, `checkPuregoConfig`, called from
+**Offsets are refused** (`namespaces_nocgo.go`, `checkNocgoConfig`, called from
 `factory_linux.go`, `Create`). `container_linux.go` puts them in the netlink
 payload (`TimeOffsetsAttr`, built when the time namespace is not being joined),
 and nsexec's stage 0 writes that payload to `/proc/<pid>/timens_offsets`
-(`nsexec.c`, `update_timens_offsets`). Under `puregoNamespaces` the payload is
+(`nsexec.c`, `update_timens_offsets`). Under `parentCreatesNamespaces` the payload is
 not built at all, while `Namespaces.CloneFlags()` still includes `CLONE_NEWTIME`,
 so `clone(2)` creates the namespace and the offsets are simply never applied: the
 container would see a zero offset and nothing would report it. Refusing is the

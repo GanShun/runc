@@ -25,7 +25,7 @@ func readOomScoreAdj(t *testing.T) int {
 // same one the container's init is given by pid, so it exercises the write and
 // not only the formatting. The value is restored afterwards either way.
 func TestApplyOomScoreAdjWithoutCgo(t *testing.T) {
-	if !puregoNamespaces {
+	if !parentCreatesNamespaces {
 		t.Skip("only the cgo-free build writes oom_score_adj from the parent")
 	}
 	original := readOomScoreAdj(t)
@@ -60,7 +60,7 @@ func TestApplyOomScoreAdjWithoutCgo(t *testing.T) {
 // value the kernel rejects must be an error, not a silent no-op that leaves the
 // container with the inherited score.
 func TestApplyOomScoreAdjRefusesWhatTheKernelRefuses(t *testing.T) {
-	if !puregoNamespaces {
+	if !parentCreatesNamespaces {
 		t.Skip("only the cgo-free build writes oom_score_adj from the parent")
 	}
 	outOfRange := 2000

@@ -668,7 +668,7 @@ func (c *Container) newInitProcess(p *Process, cmd *exec.Cmd, comm *processComm)
 		data io.Reader
 		err  error
 	)
-	if !puregoNamespaces {
+	if !parentCreatesNamespaces {
 		data, err = c.bootstrapData(c.config.Namespaces.CloneFlags(), nsMaps)
 		if err != nil {
 			return nil, err
@@ -728,7 +728,7 @@ func (c *Container) newSetnsProcess(p *Process, cmd *exec.Cmd, comm *processComm
 		data io.Reader
 		err  error
 	)
-	if !puregoNamespaces {
+	if !parentCreatesNamespaces {
 		data, err = c.bootstrapData(0, state.NamespacePaths)
 		if err != nil {
 			return nil, err

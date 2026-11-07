@@ -199,7 +199,7 @@ func stageCloneFlags() (uintptr, error) {
 // points nowhere near the cause.
 //
 // So nothing is armed here, and a config asking for one is refused before it
-// reaches this point (checkPuregoConfig).
+// reaches this point (checkNocgoConfig).
 func stagedSysProcAttr(cloneFlags uintptr) *syscall.SysProcAttr {
 	return &syscall.SysProcAttr{
 		// The child of this child is runc's, not ours. See runRuncNs.

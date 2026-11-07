@@ -42,7 +42,7 @@ func Create(root, id string, config *configs.Config) (*Container, error) {
 	if err := validate.Validate(config); err != nil {
 		return nil, err
 	}
-	if err := checkPuregoConfig(config); err != nil {
+	if err := checkNocgoConfig(config); err != nil {
 		return nil, err
 	}
 	if err := os.MkdirAll(root, 0o700); err != nil {
