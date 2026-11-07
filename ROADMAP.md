@@ -268,6 +268,35 @@ CGO_ENABLED=0 go test ./libcontainer/ -count=1
 They cover the argument, descriptor and report-pipe conventions and the
 `CLONE_PARENT` parentage, not a real `setns(2)`.
 
+### 2.5 `oom_score_adj`: the parent writes it
+
+**Verified in code:** `process_linux.go`, `applyOomScoreAdj` — a write of
+`/proc/<pid>/oom_score_adj` — called from `initProcess.start` after the cgroup
+apply, and from `setnsProcess.start` only after `execSetns`, since until the
+`runcns` stage has reported, `p.pid()` is the stage and not the exec'd process.
+Both are gated on `puregoNamespaces`; the cgo build keeps its single write, which
+nsexec's stage 0 performs from inside the container (`nsexec.c`,
+`update_oom_score_adj`, writing `/proc/self/oom_score_adj`).
+
+The value reached the kernel only through the netlink bootstrap payload, so
+without this it was dropped and the container silently kept the score it
+inherited. A value outside -1000..1000 comes back `EINVAL` and is returned as an
+error naming the pid, rather than absorbed.
+
+**Observed running:** `make test-runc K4S_RUNC_TESTS='OomScoreAdj'` in a node
+passes `TestOomScoreAdj` and `TestExecInOomScoreAdj`, both of which failed with
+`oom_score_adj 200; got 0` on `53872017`:
+
+```
+--- PASS: TestOomScoreAdj (0.11s)
+--- PASS: TestExecInOomScoreAdj (0.11s)
+passed: 2  failed: 0  skipped: 0
+```
+
+`TestApplyOomScoreAdjWithoutCgo`, `TestApplyOomScoreAdjRefusesWhatTheKernelRefuses`
+and `TestApplyOomScoreAdjLeavesAnUnsetValueAlone` guard the write itself; the first
+two were watched failing with the write made a no-op.
+
 ## 3. Untested, with what would settle each
 
 A gap with no test attached stays open indefinitely, so each item names the

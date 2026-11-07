@@ -45,6 +45,17 @@ seccomp-table-drift:
     - test "$(pkg-config --modversion libseccomp)" = "$LIBSECCOMP_VERSION"
     - CGO_ENABLED=1 go test -tags seccomp -run TestGeneratedTablesMatchCommitted ./libcontainer/seccomp/
 
+# The cgo-free unit tests. `make cover` only reaches the seccomp package, and the
+# integration job needs a privileged runner, so without this job the parent-side
+# writes, the staging wiring and the config refusals are tested nowhere but on a
+# developer's machine. They need no privileges, so they run on the shared runner.
+libcontainer-unit:
+  stage: test
+  rules: *rules
+  before_script: *toolchain
+  script:
+    - CGO_ENABLED=0 go test ./libcontainer/ -count=1
+
 # The differential against libseccomp needs cgo, so `make cover` never runs it:
 # it is CGO_ENABLED=0. Without this job nothing in CI compares the two
 # compilers, and a libseccomp version skew lands unnoticed.

@@ -525,6 +525,13 @@ func (p *setnsProcess) start() (retErr error) {
 	if err := p.setFinalCPUAffinity(); err != nil {
 		return err
 	}
+	if puregoNamespaces {
+		// Only now is p.pid() the exec'd process rather than the stage that
+		// created it; writing before execSetns would adjust the wrong one.
+		if err := applyOomScoreAdj(p.pid(), p.config.Config.OomScoreAdj); err != nil {
+			return err
+		}
+	}
 	if p.intelRdtPath != "" {
 		// if Intel RDT "resource control" filesystem path exists
 		_, err := os.Stat(p.intelRdtPath)
@@ -674,6 +681,22 @@ func (p *setnsProcess) execSetns() error {
 	}
 	p.cmd.Process = process
 	p.process.ops = p
+	return nil
+}
+
+// applyOomScoreAdj sets the container's OOM score adjustment from the parent
+// side. nsexec's stage 0 does this from inside the container, writing
+// /proc/self/oom_score_adj (nsexec.c, update_oom_score_adj), and the payload that
+// asks it to is not built without cgo -- so without this the value is dropped and
+// the container silently keeps whatever it inherited. The kernel refuses values
+// outside -1000..1000 with EINVAL, which is reported rather than absorbed.
+func applyOomScoreAdj(pid int, value *int) error {
+	if value == nil {
+		return nil
+	}
+	if err := os.WriteFile(fmt.Sprintf("/proc/%d/oom_score_adj", pid), []byte(strconv.Itoa(*value)), 0); err != nil {
+		return fmt.Errorf("unable to set oom_score_adj %d on pid %d: %w", *value, pid, err)
+	}
 	return nil
 }
 
@@ -1077,6 +1100,11 @@ func (p *initProcess) start() (retErr error) {
 	// Reset the CPU affinity after cgroups are configured to make sure it
 	// matches any configured cpuset.
 	tryResetCPUAffinity(p.pid())
+	if puregoNamespaces {
+		if err := applyOomScoreAdj(p.pid(), p.config.Config.OomScoreAdj); err != nil {
+			return err
+		}
+	}
 	if p.intelRdtManager != nil {
 		if err := p.intelRdtManager.Apply(p.pid()); err != nil {
 			return fmt.Errorf("unable to apply Intel RDT configuration: %w", err)
