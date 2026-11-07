@@ -11,9 +11,22 @@ import (
 )
 
 // Same as ../../init.go but for libcontainer/integration.
+//
+// The runcns case is not optional here: without cgo, an exec into a container that
+// has a PID namespace is staged by re-executing this binary as
+// `<argv0> runcns <pid-ns-path> ...`, and a binary that does not dispatch that
+// runs the Go test flags against it instead and exits 1. Every exec test then
+// fails with "error executing setns process: exit status 1" before reaching
+// anything it meant to check.
 func init() {
-	if len(os.Args) > 1 && os.Args[1] == "init" {
+	if len(os.Args) < 2 {
+		return
+	}
+	switch os.Args[1] {
+	case "init":
 		libcontainer.Init()
+	case libcontainer.RuncNsCommand:
+		libcontainer.RunRuncNs(os.Args[2:])
 	}
 }
 

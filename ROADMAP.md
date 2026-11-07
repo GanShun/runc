@@ -235,10 +235,26 @@ test. The alternative — a separate `runc-ns` helper — is what `libcontainer:
 stage runc exec into the container PID namespace without cgo` shipped and
 `libcontainer: make the exec PID-namespace stage a runc subcommand` replaced.
 
-**Observed running:** PR #3's description records the end-to-end check — the
-exec'd process's `/proc/self/ns/pid` matches the container init's, and a real
+**Observed running, two ways.** PR #3's description records the end-to-end check —
+the exec'd process's `/proc/self/ns/pid` matches the container init's, and a real
 CNI agent whose `postStart`/`preStop` hooks had been failing now starts with them
-intact. **Verified here:** the staging's own unit tests pass unprivileged,
+intact. And upstream's own `TestExecIn` now passes against this build, with a real
+`setns(2)`, in a k4s node, because it is the only environment that has the root
+this suite needs (issue #4):
+
+```
+make test-runc K4S_RUNC_TESTS='TestExecIn$'      # k4s, in the guest
+--- PASS: TestExecIn (0.11s)
+```
+
+That test had never run on this fork. `libcontainer/integration/init_test.go`
+mirrors `init.go` for the `"init"` subcommand but did not mirror the `runcns` one,
+so the binary re-exec'd as the stage ran the Go test flags against it and exited 1
+— every exec test failing with `error executing setns process: exit status 1`
+before reaching an assertion. The dispatch is the fix, and it is what makes the
+line above possible.
+
+**Verified here:** the staging's own unit tests pass unprivileged,
 
 ```
 CGO_ENABLED=0 go test ./libcontainer/ -count=1
