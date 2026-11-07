@@ -25,6 +25,12 @@ func stageExecNs(cmd *exec.Cmd, paths []string) (*os.File, *os.File, []string, e
 	return nil, nil, paths, nil
 }
 
+// stageInitNs is a no-op with cgo: nsexec's stage 1 joins the PID namespace and
+// its stage 2 forks, so a container's init already gets there without help.
+func stageInitNs(cmd *exec.Cmd, paths []string, _ uintptr) (*os.File, *os.File, []string, error) {
+	return nil, nil, paths, nil
+}
+
 // checkPuregoConfig checks nothing for the cgo build: nsexec writes the offsets
 // into the bootstrap payload it reads before the namespace is entered.
 func checkPuregoConfig(_ *configs.Config) error { return nil }

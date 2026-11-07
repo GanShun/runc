@@ -37,6 +37,16 @@ const RuncNsCommand = "runcns"
 // exactly one definition.
 const runcNsReportFdEnv = "_LIBCONTAINER_RUNCNS_PIDFD"
 
+// runcNsCloneFlagsEnv carries the attributes the staged
+// process must be created with. An exec child takes none: it joins the container's
+// namespaces by setns, and its parent-death signal is runc's business. A
+// container's own init needs them, because this stage's clone(2) is the
+// container's fork: the only thing that creates a process in the PID namespace
+// just joined.
+//
+// The parent-death signal is deliberately not carried: see stagedSysProcAttr.
+const runcNsCloneFlagsEnv = "_LIBCONTAINER_RUNCNS_CLONEFLAGS"
+
 // RunRuncNs is the entry point for RuncNsCommand, with args being everything
 // after the subcommand name.
 //
@@ -154,11 +164,54 @@ func runRuncNs(args []string) error {
 		return fmt.Errorf("setns(CLONE_NEWPID, %s): %w", pidNsPath, err)
 	}
 
-	return startExecNsStage(argv, reportFd)
+	cloneFlags, err := stageCloneFlags()
+	if err != nil {
+		return err
+	}
+	return startExecNsStage(argv, reportFd, cloneFlags)
+}
+
+// stageCloneFlags reads the namespaces runc passed down for the staged process.
+// Absent means an exec child, which takes none of its own.
+func stageCloneFlags() (uintptr, error) {
+	v := strings.TrimSpace(os.Getenv(runcNsCloneFlagsEnv))
+	if v == "" {
+		return 0, nil
+	}
+	f, err := strconv.ParseUint(v, 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("%s: %w", runcNsCloneFlagsEnv, err)
+	}
+	return uintptr(f), nil
+}
+
+// stagedSysProcAttr is how the staged process is created, and Pdeathsig is never
+// set here.
+//
+// Go's fork code arms a requested parent-death signal by comparing the child's
+// getppid() with the forking process's own pid and killing the child when they
+// differ (syscall/exec_linux.go, forkAndExecInChild1). CLONE_PARENT makes them
+// differ by construction -- the child's parent is runc, not this stage -- and
+// inside the joined PID namespace getppid() is 0, so the child would signal itself
+// before execve. cmd.Start() still reports success, because a child that dies
+// before execve closes the error pipe with nothing written and Go reads that EOF as
+// success, so the failure would surface later as a cgroup or init-pipe error that
+// points nowhere near the cause.
+//
+// So nothing is armed here, and a config asking for one is refused before it
+// reaches this point (checkPuregoConfig).
+func stagedSysProcAttr(cloneFlags uintptr) *syscall.SysProcAttr {
+	return &syscall.SysProcAttr{
+		// The child of this child is runc's, not ours. See runRuncNs.
+		Cloneflags: syscall.CLONE_PARENT | cloneFlags,
+	}
 }
 
 // startExecNsStage starts the next stage and reports its host PID to runc.
-func startExecNsStage(argv []string, reportFd int) error {
+//
+// cloneFlags are the namespaces the clone(2) that creates it must add: none for an
+// exec child, the container's own for a container's init.
+func startExecNsStage(argv []string, reportFd int, cloneFlags uintptr) error {
 	// If anything below fails after the clone, runc must see EOF on the report
 	// pipe rather than wait for a pid that will never arrive. Close-on-exec
 	// also keeps the descriptor out of the container's process, which is both
@@ -189,10 +242,7 @@ func startExecNsStage(argv []string, reportFd int) error {
 		//
 		// Env is left nil, so the child inherits this process's environment --
 		// every _LIBCONTAINER_* variable runc set, unexamined.
-		SysProcAttr: &syscall.SysProcAttr{
-			// The child of this child is runc's, not ours. See runRuncNs.
-			Cloneflags: syscall.CLONE_PARENT,
-		},
+		SysProcAttr: stagedSysProcAttr(cloneFlags),
 	}
 
 	// No access(2) pre-check here, deliberately. argv[0] is often

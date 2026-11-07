@@ -126,6 +126,22 @@ type containerProcess struct {
 	process       *Process
 	bootstrapData io.Reader
 	container     *Container
+
+	// pidReport is the parent's end of the pipe the RuncNsCommand stage reports
+	// the staged process's host PID on, and pidReportChild the child's end, which
+	// the stage inherits. Both are nil unless this process is staged; see
+	// stageExecNs and stageInitNs.
+	pidReport      *os.File
+	pidReportChild *os.File
+}
+
+// closePidReportChild closes the parent's copy of the report pipe's write end.
+// Nothing can be reported once it is closed, so the parent's read then returns
+// EOF rather than waiting for a pid from a stage that has died.
+func (p *containerProcess) closePidReportChild() {
+	if p.pidReportChild != nil {
+		_ = p.pidReportChild.Close()
+	}
 }
 
 func (p *containerProcess) pid() int {
@@ -178,22 +194,6 @@ type setnsProcess struct {
 	rootlessCgroups bool
 	intelRdtPath    string
 	initProcessPid  int
-
-	// pidReport is the parent's end of the pipe the RuncNsCommand stage reports
-	// the exec'd process's host PID on, and pidReportChild the child's end, which
-	// the stage inherits. Both are nil unless this exec is staged through the
-	// stage; see stageExecNs.
-	pidReport      *os.File
-	pidReportChild *os.File
-}
-
-// closePidReportChild closes the parent's copy of the report pipe's write end.
-// Nothing can be reported once it is closed, so the parent's read then returns
-// EOF rather than waiting for a pid from a stage that has died.
-func (p *setnsProcess) closePidReportChild() {
-	if p.pidReportChild != nil {
-		_ = p.pidReportChild.Close()
-	}
 }
 
 // tryResetCPUAffinity tries to reset the CPU affinity of the process
@@ -686,7 +686,20 @@ func (p *setnsProcess) execSetns() error {
 // here, and the SIGCHLD loop in runc's main package sees it exit. That is the
 // whole reason for CLONE_PARENT -- the process runc has to report the exit
 // status of is this one, not the stage, which has already done its job.
-func (p *setnsProcess) adoptRuncNsChild() (retErr error) {
+func (p *setnsProcess) adoptRuncNsChild() error {
+	process, err := adoptStagedChild(p.containerProcess)
+	if err != nil {
+		return err
+	}
+	p.cmd.Process = process
+	p.process.ops = p
+	return nil
+}
+
+// adoptStagedChild reads the report the RuncNsCommand stage writes, reaps the
+// stage, and returns the process it staged. Both a container's init and an exec
+// go through it: the two differ in what was staged, not in how the report is read.
+func adoptStagedChild(p containerProcess) (_ *os.Process, retErr error) {
 	// The stage holds its own copy of the write end and has already been
 	// started, so the only thing this copy can do now is stop a failed stage
 	// from showing up as EOF. Close it before reading.
@@ -741,12 +754,12 @@ func (p *setnsProcess) adoptRuncNsChild() (retErr error) {
 		// The stage died without reporting. Its own exit status is all there
 		// is; the reason, when it had one, is on the report it never finished.
 		if status, werr := p.cmd.Process.Wait(); werr == nil && status != nil && !status.Success() {
-			return &exec.ExitError{ProcessState: status}
+			return nil, &exec.ExitError{ProcessState: status}
 		}
-		return fmt.Errorf("error reading pid reported by %s: %w", RuncNsCommand, readErr)
+		return nil, fmt.Errorf("error reading pid reported by %s: %w", RuncNsCommand, readErr)
 	}
 	if parseErr != nil {
-		return fmt.Errorf("error parsing pid %q reported by %s: %w", report, RuncNsCommand, parseErr)
+		return nil, fmt.Errorf("error parsing pid %q reported by %s: %w", report, RuncNsCommand, parseErr)
 	}
 	if stageErr != nil {
 		if pid > 0 {
@@ -768,22 +781,16 @@ func (p *setnsProcess) adoptRuncNsChild() (retErr error) {
 			// no-op -- killProcess refuses a pid that is not positive -- instead of
 			// a signal to whatever the kernel has since handed that number to.
 		}
-		return fmt.Errorf("%s stage: %w", RuncNsCommand, stageErr)
+		return nil, fmt.Errorf("%s stage: %w", RuncNsCommand, stageErr)
 	}
 
 	// Reap the stage before replacing the Process, so nothing is left behind
-	// for the wait that is now aimed at the exec'd process.
+	// for the wait that is now aimed at the staged process.
 	if _, err := p.cmd.Process.Wait(); err != nil {
-		return fmt.Errorf("error waiting for the %s stage to exit: %w", RuncNsCommand, err)
+		return nil, fmt.Errorf("error waiting for the %s stage to exit: %w", RuncNsCommand, err)
 	}
 
-	process, err := os.FindProcess(pid)
-	if err != nil {
-		return err
-	}
-	p.cmd.Process = process
-	p.process.ops = p
-	return nil
+	return os.FindProcess(pid)
 }
 
 // killProcess sends SIGKILL to pid, best-effort. It exists for the failure
@@ -1001,6 +1008,19 @@ func (p *initProcess) start() (retErr error) {
 	if err != nil {
 		p.process.ops = nil
 		return fmt.Errorf("unable to start init: %w", err)
+	}
+
+	// A staged init is not this process's direct child: the runcns stage created
+	// it with CLONE_PARENT, so it is runc's, and the stage reports its pid. Adopt
+	// it before anything aims at p.pid() -- the cgroup apply below is the first
+	// thing that would otherwise land on the stage instead of the container.
+	if p.pidReport != nil {
+		process, adoptErr := adoptStagedChild(p.containerProcess)
+		if adoptErr != nil {
+			p.process.ops = nil
+			return fmt.Errorf("unable to adopt the staged init: %w", adoptErr)
+		}
+		p.cmd.Process = process
 	}
 
 	defer func() {

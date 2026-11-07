@@ -683,16 +683,30 @@ func (c *Container) newInitProcess(p *Process, cmd *exec.Cmd, comm *processComm)
 	if err != nil {
 		return nil, err
 	}
+	// A PID namespace given by path cannot be joined by setns(2) alone, and this
+	// child would otherwise be created by runc's own clone(2) in the *host's* PID
+	// namespace: pidns_install only arms the caller's next child, and only a
+	// process created after that lands inside. So the init is staged exactly as an
+	// exec is, with its own namespaces and parent-death signal moved onto the
+	// stage's clone.
+	reportParent, reportChild, rest, err := stageInitNs(cmd, config.NamespacePaths,
+		c.config.Namespaces.CloneFlags())
+	if err != nil {
+		return nil, err
+	}
+	config.NamespacePaths = rest
 
 	init := &initProcess{
 		containerProcess: containerProcess{
-			cmd:           cmd,
-			comm:          comm,
-			manager:       c.cgroupManager,
-			config:        config,
-			process:       p,
-			bootstrapData: data,
-			container:     c,
+			cmd:            cmd,
+			comm:           comm,
+			manager:        c.cgroupManager,
+			config:         config,
+			process:        p,
+			bootstrapData:  data,
+			container:      c,
+			pidReport:      reportParent,
+			pidReportChild: reportChild,
 		},
 		intelRdtManager: c.intelRdtManager,
 	}
@@ -737,19 +751,19 @@ func (c *Container) newSetnsProcess(p *Process, cmd *exec.Cmd, comm *processComm
 
 	proc := &setnsProcess{
 		containerProcess: containerProcess{
-			cmd:           cmd,
-			comm:          comm,
-			manager:       c.cgroupManager,
-			config:        config,
-			process:       p,
-			bootstrapData: data,
-			container:     c,
+			pidReport:      reportParent,
+			pidReportChild: reportChild,
+			cmd:            cmd,
+			comm:           comm,
+			manager:        c.cgroupManager,
+			config:         config,
+			process:        p,
+			bootstrapData:  data,
+			container:      c,
 		},
 		rootlessCgroups: c.config.RootlessCgroups,
 		intelRdtPath:    state.IntelRdtPath,
 		initProcessPid:  state.InitProcessPid,
-		pidReport:       reportParent,
-		pidReportChild:  reportChild,
 	}
 	return proc, nil
 }

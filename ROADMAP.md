@@ -337,20 +337,38 @@ command or assertion that would close it.
    is its own session and process-group leader. A `CGO_ENABLED=1` run is the
    reference.
 
-5. **`ParentDeathSignal`.** `container_linux.go`, `newParentProcess`, sets
-   `Pdeathsig` on the process runc starts directly, whatever `p.Init` is. In the
-   exec path that process is now the `runcns` stage, which exits immediately
-   after reporting the PID, and the process it creates inherits nothing either:
-   `copy_process` clears the field for every new task (`kernel/fork.c`) and the
-   signal is delivered only to a dying task's children at reparenting time
-   (`kernel/exit.c`). Whether the cgo build's stage-0 arrangement delivers it to
-   an exec'd process either is not something this port changed, and neither path
-   has been measured.
-   *Would settle it:* `prctl(PR_GET_PDEATHSIG)` read inside the container init
-   and inside an exec'd process, for both `CGO_ENABLED=0` and `CGO_ENABLED=1`
-   builds, plus a bundle that sets `ParentDeathSignal` and a killed runc — the
-   exec'd process must receive it.
+5. **`ParentDeathSignal` is refused, and the reason is measured.** Every
+   cgo-free container is affected, not only one whose init carries a stage --
+   `checkPuregoConfig` is reached from `factory_linux.go`, `Create`. The signal
+   follows the thread that forked the child: Go forks it from whichever runc
+   thread called `cmd.Start()` and `PR_SET_PDEATHSIG` is delivered when that
+   *task* exits, which the Go runtime may do at any time (golang/go#27505). A
+   container would therefore die with runc's thread while runc kept running.
 
+   Where a stage is involved there is a second, measured reason. The stage clones
+   the init with `CLONE_PARENT`, so the init's real parent is runc -- the thread
+   that forked the stage. A two-level probe (`runc` -> plain fork -> stage ->
+   `CLONE_PARENT` -> init) shows it:
+
+   ```
+   runc-like pid=2221126, its parent=2221069
+   stage pid=2221132, its parent=2221126, init pid=2221138, init's real parent=2221126
+   ```
+
+   Letting Go's own fork code arm the signal is no better: `forkAndExecInChild1`
+   compares the child's `getppid()` with the *forking* process's pid
+   (`syscall/exec_linux.go`), which here is the stage (2221132) and not the parent
+   (2221126), so it kills the init at birth -- and `cmd.Start()` still reports
+   success, because a child that dies before `execve` closes the error pipe with
+   nothing written.
+
+   Upstream runc honours the field despite the same threading behaviour, so this
+   is deliberately stricter: a signal that arrives at an unrelated moment is worse
+   than a refusal that names the field.
+   `TestCheckPuregoConfigRefusesParentDeathSignal` and
+   `TestStagedSysProcAttrNeverArmsPdeathsig` are the guards. *Observed running:*
+   the refusal and the probe; the cgo build's own arrangement is unchanged and was
+   not re-measured.
 6. **Mount-source remapping.** The `procMountPlease`/`procMountFd` handshake
    that lets runc's own (host-side, privileged) thread open a mount source for
    the container is wired only for the container init: `process_linux.go`,
@@ -452,6 +470,9 @@ Rootful containers, which is what this port is for, are unaffected.
 
 ### 4.2 Joining a PID namespace by path, for a container init
 
+**Supported, as of the `runcns` staging for an init.** This section used to say it
+was refused; what follows is the kernel rule that made it hard and what changed.
+
 ```c
 // kernel/pid_namespace.c, pidns_install
 	put_pid_ns(nsproxy->pid_ns_for_children);
@@ -460,32 +481,45 @@ Rootful containers, which is what this port is for, are unaffected.
 ```
 
 The caller does not move — only its next child is created in the target — so a
-`setns(2)` alone cannot join one, and a container init needs a fork that
-continues the same program, which Go cannot do. It is refused, not skipped
-(`join_namespaces_nocgo.go`, `joinNamespaces`); the namespace is created by
-`clone(2)` instead, which is what makes the child PID 1 (§2.1). For `runc exec`
-the same kernel rule is satisfied by re-exec rather than a raw fork (§2.4). The
-ancestor rule in the same function (`pidns_is_ancestor`) is why the stage's own
-`setns` only works while the container's namespace is a descendant of runc's,
-and `nr = pid_vnr(pid)` (`kernel/fork.c`) is why the PID the stage reports is
-the host PID runc needs.
+`setns(2)` alone cannot join one, and a container init needs a fork that continues
+the same program, which Go cannot do. `runc exec` already satisfied that with a
+re-exec (`RuncNsCommand`, §2.4); an init now uses the same stage.
 
-**What this costs a pod.** Two shapes cannot start, and both are ordinary in a
-Kubernetes cluster:
+The difference is what the stage's `clone(2)` does. An exec child takes none of
+its own namespaces, so the stage clones it with `CLONE_PARENT` alone. A
+container's init owns its private namespaces, and the stage's clone *is* the
+container's fork: the init's clone flags and its parent-death signal move off
+`cmd.SysProcAttr` and onto that clone, carried in
+`_LIBCONTAINER_RUNCNS_CLONEFLAGS` and `_LIBCONTAINER_RUNCNS_PDEATHSIG`
+(`purego_nocgo.go`, `stageInitNs`; `runcns_linux.go`, `stageCloneAttrs`). The
+stage itself keeps runc's namespaces, which is what makes the target reachable: it
+cannot `setns` into a PID namespace it is also creating.
 
-- `shareProcessNamespace: true`, where the app containers are given the pause
-  container's PID namespace by path;
-- ephemeral containers from `kubectl debug --target=<container>`, which are
-  given the target's PID namespace by path.
+On runc's side the staged init is adopted before anything aims at
+`p.cmd.Process` (`process_linux.go`, `initProcess.start`, `adoptStagedChild`),
+because the cgroup apply is the first thing that would otherwise land on the stage
+rather than on the container.
 
-The mechanism that would fix it is the one §2.4 adds for `runc exec`: start the
-init stage through `RuncNsCommand`, carry the init's clone flags onto its
-`clone(2)`, and adopt the reported PID in `initProcess.start()` before the cgroup
-is applied, as `adoptRuncNsChild` does. Two things to get right: the
-parent-death signal under `CLONE_PARENT`, and the cgroup-namespace root on the
-path that does not use `CLONE_INTO_CGROUP`. Upstream's `TestInitJoinPID` is the
-acceptance test (it needs root). The consumer-side check belongs in k4s: a
-`shareProcessNamespace` pod in `make test-cluster`.
+**Observed running.** `TestInitJoinPID` and `TestSharedPidnsInitKill` pass against
+this build, with real containers and a real `setns(2)`, in a k4s node — the only
+environment that has the root this suite needs (issue #4):
+
+```
+make test-runc K4S_RUNC_TESTS='TestInitJoinPID|TestSharedPidnsInitKill'
+--- PASS: TestSharedPidnsInitKill (0.11s)
+--- PASS: TestInitJoinPID (0.22s)
+```
+
+**Still refused:** joining a PID namespace by path for anything that is not an
+init or an exec (`join_namespaces_nocgo.go`, `joinNamespaces`), which is no longer
+reachable through libcontainer's own callers and stays as the guard against a
+future one that forgets to stage. The refusal also covers a *time* namespace, for
+the single-threaded reason in §4.1.
+
+The ancestor rule in `pidns_install` (`pidns_is_ancestor`) is why the stage's own
+`setns` only works while the container's namespace is a descendant of runc's, and
+`nr = pid_vnr(pid)` (`kernel/fork.c`) is why the PID the stage reports is the
+container's in runc's own namespace rather than an integer from the inside.
 
 ### 4.3 Checkpoint/restore (CRIU)
 

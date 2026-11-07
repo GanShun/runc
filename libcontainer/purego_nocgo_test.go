@@ -12,10 +12,11 @@ import (
 	"reflect"
 	"strconv"
 	"strings"
+	"syscall"
 	"testing"
+	"time"
 
 	"golang.org/x/sys/unix"
-	"time"
 )
 
 // These tests cover the wiring between runc and the RuncNsCommand staging
@@ -203,7 +204,7 @@ func TestStartExecNsStageStartsCallerParentedChild(t *testing.T) {
 	// argv is exactly the layout stageExecNs builds and the stage's runRuncNs
 	// takes as its args[1:]: program, argv0, then the program's own arguments.
 	argv := []string{os.Args[0], "runc-argv0", "-test.run=TestPuregoNocgoHelperProcess"}
-	if err := startExecNsStage(argv, int(reportChild.Fd())); err != nil {
+	if err := startExecNsStage(argv, int(reportChild.Fd()), 0); err != nil {
 		t.Fatalf("startExecNsStage: %v", err)
 	}
 	_ = reportChild.Close()
@@ -285,8 +286,7 @@ func TestAdoptRuncNsChildAdoptsReportedPid(t *testing.T) {
 	_ = reportChild.Close()
 
 	p := &setnsProcess{
-		containerProcess: containerProcess{cmd: helper, process: &Process{}},
-		pidReport:        reportParent,
+		containerProcess: containerProcess{cmd: helper, process: &Process{}, pidReport: reportParent},
 	}
 	if err := p.adoptRuncNsChild(); err != nil {
 		t.Fatalf("adoptRuncNsChild: %v", err)
@@ -321,8 +321,7 @@ func TestAdoptRuncNsChildRefusesNonPositivePid(t *testing.T) {
 			_ = reportChild.Close()
 
 			p := &setnsProcess{
-				containerProcess: containerProcess{cmd: helper, process: &Process{}},
-				pidReport:        reportParent,
+				containerProcess: containerProcess{cmd: helper, process: &Process{}, pidReport: reportParent},
 			}
 			if err := p.adoptRuncNsChild(); err == nil {
 				t.Fatalf("pid %s was accepted as a process id", pid)
@@ -360,8 +359,7 @@ func TestAdoptRuncNsChildKillsUnadoptedProcess(t *testing.T) {
 	_ = reportChild.Close()
 
 	p := &setnsProcess{
-		containerProcess: containerProcess{cmd: helper, process: &Process{}},
-		pidReport:        reportParent,
+		containerProcess: containerProcess{cmd: helper, process: &Process{}, pidReport: reportParent},
 	}
 	if err := p.adoptRuncNsChild(); err == nil {
 		t.Fatal("expected a malformed report to fail adoption")
@@ -506,8 +504,7 @@ func TestAdoptRuncNsChildReapsAFailedHandover(t *testing.T) {
 	defer func() { killProcessSeen = nil }()
 
 	p := &setnsProcess{
-		containerProcess: containerProcess{cmd: helper, process: &Process{}},
-		pidReport:        reportParent,
+		containerProcess: containerProcess{cmd: helper, process: &Process{}, pidReport: reportParent},
 	}
 	if err := p.adoptRuncNsChild(); err == nil {
 		t.Fatal("expected a failed handover to fail adoption")
@@ -542,5 +539,119 @@ func TestAdoptRuncNsChildReapsAFailedHandover(t *testing.T) {
 	var ws unix.WaitStatus
 	if got, err := unix.Wait4(targetPid, &ws, unix.WNOHANG, nil); err != unix.ECHILD {
 		t.Errorf("Wait4(%d) = %d, %v; want ECHILD: the process was left for someone else to reap", targetPid, got, err)
+	}
+}
+
+// TestStageInitNsWiresStage pins what staging a container's init has to do
+// differently from staging an exec, because getting any of it wrong fails
+// silently rather than loudly: the clone flags would be applied to the stage
+// instead of to the init, or left off the init entirely, and the container would
+// come up in the wrong namespaces.
+func TestStageInitNsWiresStage(t *testing.T) {
+	const (
+		pidPath    = "/proc/1/ns/pid"
+		cloneFlags = unix.CLONE_NEWNS | unix.CLONE_NEWUTS
+		pdeathsig  = unix.SIGKILL
+	)
+	// Built the way newParentProcess builds it: the container's namespaces are
+	// already on SysProcAttr, and staging has to take them off again.
+	cmd := &exec.Cmd{
+		Path: "/proc/self/fd/7",
+		Args: []string{"runc-own-argv0", "init"},
+		Env:  []string{},
+		SysProcAttr: &syscall.SysProcAttr{
+			Cloneflags: cloneFlags,
+			Pdeathsig:  pdeathsig,
+		},
+	}
+
+	reportParent, reportChild, rest, err := stageInitNs(cmd, []string{"uts:" + pidPath, "pid:" + pidPath}, cloneFlags)
+	if err != nil {
+		t.Fatalf("stageInitNs: %v", err)
+	}
+	defer reportParent.Close()
+	defer reportChild.Close()
+
+	if len(rest) != 1 || rest[0] != "uts:"+pidPath {
+		t.Errorf("rest = %v, want only the uts entry: the init must not be told to join the PID path it is staged into", rest)
+	}
+	wantArgs := []string{"runc-own-argv0", RuncNsCommand, pidPath, "/proc/self/fd/7", "runc-own-argv0", "init"}
+	if strings.Join(cmd.Args, " ") != strings.Join(wantArgs, " ") {
+		t.Errorf("args = %v, want %v", cmd.Args, wantArgs)
+	}
+	if cmd.Path != "/proc/self/fd/7" {
+		t.Errorf("path = %q, want the sealed copy the stage and the init are both exec'd from", cmd.Path)
+	}
+
+	// The stage keeps runc's namespaces. It has to reach the PID namespace by
+	// path, which it cannot do from inside a namespace it is also creating.
+	if cmd.SysProcAttr.Cloneflags != 0 {
+		t.Errorf("stage cloneflags = %#x, want 0: the stage is not the container", cmd.SysProcAttr.Cloneflags)
+	}
+	env := strings.Join(cmd.Env, "\n")
+	if want := runcNsCloneFlagsEnv + "=" + strconv.FormatUint(uint64(cloneFlags), 10); !strings.Contains(env, want) {
+		t.Errorf("env is missing %q, so the init's own namespaces would never be created:\n%s", want, env)
+	}
+	// The parent-death signal must NOT travel: CLONE_PARENT makes the child's
+	// getppid() differ from this process's pid, and Go's fork code kills a child
+	// whose parent-death signal cannot be armed for the right parent.
+	if strings.Contains(env, "PDEATHSIG") {
+		t.Errorf("the stage was told to arm a parent-death signal, which kills the child before execve:\n%s", env)
+	}
+	if cmd.SysProcAttr.Pdeathsig != 0 {
+		t.Errorf("stage Pdeathsig = %v, want 0: checkPuregoConfig refuses the field instead", cmd.SysProcAttr.Pdeathsig)
+	}
+
+	// The report pipe is appended last so that every descriptor number computed
+	// before it still names what its _LIBCONTAINER_* variable says.
+	if len(cmd.ExtraFiles) != 1 || cmd.ExtraFiles[len(cmd.ExtraFiles)-1] != reportChild {
+		t.Fatalf("ExtraFiles = %v, want the report pipe's write end last", cmd.ExtraFiles)
+	}
+	if want := runcNsReportFdEnv + "=" + strconv.Itoa(stdioFdCount+len(cmd.ExtraFiles)-1); !strings.Contains(env, want) {
+		t.Errorf("env is missing %q, so the stage would not know where to report:\n%s", want, env)
+	}
+}
+
+// TestStageInitNsLeavesAnInitWithoutAPidPathAlone is the other half: with no PID
+// namespace by path there is nothing to stage, and the direct child stays runc
+// init -- the same rule stageExecNs follows.
+func TestStageInitNsLeavesAnInitWithoutAPidPathAlone(t *testing.T) {
+	cmd := &exec.Cmd{Path: "/proc/self/fd/7", Args: []string{"runc-own-argv0", "init"}, Env: []string{},
+		SysProcAttr: &syscall.SysProcAttr{Cloneflags: unix.CLONE_NEWNS}}
+	paths := []string{"uts:uts"}
+
+	reportParent, reportChild, rest, err := stageInitNs(cmd, paths, unix.CLONE_NEWNS)
+	if err != nil {
+		t.Fatalf("stageInitNs: %v", err)
+	}
+	if reportParent != nil || reportChild != nil {
+		t.Error("a report pipe was created for an init that has nothing to stage")
+	}
+	if strings.Join(rest, ",") != strings.Join(paths, ",") {
+		t.Errorf("rest = %v, want the paths unchanged", rest)
+	}
+	if cmd.SysProcAttr.Cloneflags != unix.CLONE_NEWNS {
+		t.Errorf("stage cloneflags = %#x, want the container's %#x: nothing is staged, so the child is the init", cmd.SysProcAttr.Cloneflags, unix.CLONE_NEWNS)
+	}
+	if strings.Join(cmd.Args, " ") != "runc-own-argv0 init" {
+		t.Errorf("args = %v, want them untouched", cmd.Args)
+	}
+}
+
+// TestStagedSysProcAttrNeverArmsPdeathsig pins the invariant that cost a bug: with
+// CLONE_PARENT the staged child's parent is runc, so Go's fork code -- which arms a
+// requested parent-death signal by comparing the child's getppid() with the forking
+// process's pid -- kills it before execve. cmd.Start() still succeeds, because a
+// child that dies before execve closes the error pipe with nothing written, so the
+// failure appears much later and points nowhere near the cause.
+func TestStagedSysProcAttrNeverArmsPdeathsig(t *testing.T) {
+	for _, cloneFlags := range []uintptr{0, unix.CLONE_NEWNS, unix.CLONE_NEWNS | unix.CLONE_NEWUTS | unix.CLONE_NEWCGROUP} {
+		attr := stagedSysProcAttr(cloneFlags)
+		if attr.Pdeathsig != 0 {
+			t.Errorf("cloneFlags %#x: Pdeathsig = %v, want 0: Go would kill the child before execve", cloneFlags, attr.Pdeathsig)
+		}
+		if attr.Cloneflags != unix.CLONE_PARENT|cloneFlags {
+			t.Errorf("cloneFlags %#x: Cloneflags = %#x, want CLONE_PARENT plus the container's namespaces", cloneFlags, attr.Cloneflags)
+		}
 	}
 }

@@ -63,9 +63,53 @@ func setCloneFlags(cmd *exec.Cmd, flags uintptr) {
 // namespace to join. With no PID namespace there is nothing to stage, and the
 // direct child stays runc init.
 func stageExecNs(cmd *exec.Cmd, paths []string) (reportParent, reportChild *os.File, rest []string, err error) {
+	return stageNs(cmd, paths, 0)
+}
+
+// stageInitNs is stageExecNs for the container's own init, and differs in what the
+// stage must do with the clone(2) that creates the process.
+//
+// An exec child joins every namespace by setns and takes none of its own, so the
+// stage clones it with CLONE_PARENT alone. A container's init owns its private
+// namespaces: with cgo, nsexec's stage 2 creates them and forks stage 3 in. Here
+// the stage's clone(2) is that fork, so the init's clone flags travel down to it —
+// and they must, because that clone is the only thing that creates a process
+// inside the PID namespace that was just joined. The stage itself keeps runc's
+// namespaces; that is what makes the setns target reachable.
+//
+// The parent-death signal is the exception: it is *not* passed down, because Go's
+// fork code kills a child whose getppid() differs from the forking process's pid and
+// CLONE_PARENT makes that always true. A config that asks for one is refused before
+// it gets this far (checkPuregoConfig); stagedSysProcAttr has the whole of it.
+func stageInitNs(cmd *exec.Cmd, paths []string, cloneFlags uintptr) (reportParent, reportChild *os.File, rest []string, err error) {
+	return stageNs(cmd, paths, cloneFlags)
+}
+
+// stageNs is the staging both callers above need: it takes the PID namespace path
+// out of the list the init stage would join, points cmd at RuncNsCommand, and
+// hands back the report pipe when there is something to stage.
+func stageNs(cmd *exec.Cmd, paths []string, cloneFlags uintptr) (reportParent, reportChild *os.File, rest []string, err error) {
 	rest, pidPath := splitPidNamespacePath(paths)
 	if pidPath == "" {
 		return nil, nil, paths, nil
+	}
+
+	// The stage must not be cloned into the container's namespaces: it has to
+	// reach the PID namespace by path with setns(2), and it cannot do that from
+	// inside a namespace it is also creating. An exec child never had any here;
+	// an init's were applied to cmd by newParentProcess, so they are moved to the
+	// environment for the stage's own clone.
+	if cmd.SysProcAttr != nil {
+		if cloneFlags != 0 {
+			cmd.SysProcAttr.Cloneflags = 0
+		}
+		// The stage is runc's direct child, so a parent-death signal on it would
+		// work -- and be pointless, since it exits immediately. Nothing else arms
+		// one either: checkPuregoConfig refuses the config that asks for it.
+		cmd.SysProcAttr.Pdeathsig = 0
+	}
+	if cloneFlags != 0 {
+		cmd.Env = append(cmd.Env, runcNsCloneFlagsEnv+"="+strconv.FormatUint(uint64(cloneFlags), 10))
 	}
 
 	reportParent, reportChild, err = os.Pipe()
@@ -130,7 +174,18 @@ func splitPidNamespacePath(paths []string) (rest []string, pidPath string) {
 // one with zero offsets and the container silently gets the host's clocks.
 // Silently is the problem: the caller asked for a shifted clock, and nothing in
 // the container would show that it did not get one.
+//
+// The parent-death signal cannot be honoured either, and for a reason that does
+// not depend on the staging: Go forks the container's init from whichever runc
+// thread called cmd.Start, and PR_SET_PDEATHSIG follows that thread, so the Go
+// runtime retiring it would kill a container whose runc is still running
+// (golang/go#27505). Upstream runc honours the field anyway; this build refuses
+// it rather than deliver a signal that means something other than the caller
+// asked for.
 func checkPuregoConfig(config *configs.Config) error {
+	if config.ParentDeathSignal > 0 {
+		return fmt.Errorf("ParentDeathSignal cannot be honoured without cgo: the container's parent is a runc thread, which the Go runtime may retire at any time (golang/go#27505)")
+	}
 	// len, not nil: specconv copies spec.Linux.TimeOffsets straight through, so a
 	// spec carrying "timeOffsets": {} arrives as an empty non-nil map and asks
 	// for nothing.

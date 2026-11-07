@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/opencontainers/runtime-spec/specs-go"
+	"golang.org/x/sys/unix"
 
 	"github.com/opencontainers/runc/libcontainer/configs"
 )
@@ -47,5 +48,21 @@ func TestCheckPuregoConfigRefusesTimeOffsets(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "timeOffsets cannot be applied without cgo") {
 		t.Errorf("Create: err = %q, want the timeOffsets refusal", err)
+	}
+}
+
+// TestCheckPuregoConfigRefusesParentDeathSignal covers the configuration that
+// cannot be honoured rather than the one that is merely unimplemented: the init is
+// cloned with CLONE_PARENT, so its real parent is the runc thread that forked the
+// stage, and arming PR_SET_PDEATHSIG against that thread kills a container whose
+// runc is still alive the moment Go retires the thread.
+func TestCheckPuregoConfigRefusesParentDeathSignal(t *testing.T) {
+	config := &configs.Config{ParentDeathSignal: int(unix.SIGKILL)}
+	err := checkPuregoConfig(config)
+	if err == nil {
+		t.Fatal("expected ParentDeathSignal to be refused")
+	}
+	if !strings.Contains(err.Error(), "ParentDeathSignal") {
+		t.Errorf("error = %v, want it to name the field it refuses", err)
 	}
 }
