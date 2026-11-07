@@ -41,14 +41,41 @@ const runcNsReportFdEnv = "_LIBCONTAINER_RUNCNS_PIDFD"
 // after the subcommand name.
 //
 // It never returns, like Init: it either does its job and exits, or reports the
-// reason on stderr and exits non-zero. The caller is the runc binary's dispatch,
-// which runs before the CLI and before anything else has touched stderr.
+// reason to runc and exits non-zero.
 func RunRuncNs(args []string) {
 	if err := runRuncNs(args); err != nil {
-		fmt.Fprintf(os.Stderr, "%s: %v\n", RuncNsCommand, err)
+		reportFailure(err)
 		os.Exit(1)
 	}
 	os.Exit(0)
+}
+
+// reportFailure tells runc why the stage failed, over the report descriptor.
+//
+// Not stderr: this process's stderr is the exec'd process's stderr, so printing
+// there puts the reason in whatever the container writes to and leaves runc with a
+// bare exit status -- the caller sees "exit status 1" and the diagnosis is in the
+// container's log, or nowhere.
+//
+// A stage with no descriptor -- invoked by hand, or by a test -- falls back to
+// stderr, which is all there is in that case.
+func reportFailure(stageErr error) {
+	fd, err := strconv.Atoi(strings.TrimSpace(os.Getenv(runcNsReportFdEnv)))
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "%s: %v\n", RuncNsCommand, stageErr)
+		return
+	}
+	// A pid of 0 says no process was created, so runc has nothing to kill.
+	// Newlines would end the report early.
+	_ = writeReport(fd, 0, "err: "+strings.ReplaceAll(stageErr.Error(), "\n", " "))
+}
+
+// writeReport writes what runc reads: the host pid of the process the stage
+// created (or 0 if it created none), then what happened to it. One write, because
+// a write below PIPE_BUF is atomic and runc reads exactly one line.
+func writeReport(fd, pid int, status string) error {
+	_, err := unix.Write(fd, []byte(strconv.Itoa(pid)+" "+status+"\n"))
+	return err
 }
 
 // runRuncNs stages <program> into the PID namespace at <pid-namespace-path> and
@@ -168,6 +195,10 @@ func startExecNsStage(argv []string, reportFd int) error {
 		},
 	}
 
+	// No access(2) pre-check here, deliberately. argv[0] is often
+	// /proc/self/fd/N for a sealed memfd, where access(X_OK) and execve(2)
+	// disagree -- it was tried and refused paths that execute fine, which is a
+	// worse bug than the one it was meant to prevent.
 	if err := cmd.Start(); err != nil {
 		return fmt.Errorf("start %s: %w", argv[0], err)
 	}
@@ -176,8 +207,7 @@ func startExecNsStage(argv []string, reportFd int) error {
 	// the value clone(2) returned is the child's number in *this* process's
 	// active namespace -- runc's -- which is the number runc needs.
 	// (kernel/fork.c:2761: nr = pid_vnr(pid).)
-	report := strconv.Itoa(cmd.Process.Pid) + "\n"
-	if _, err := unix.Write(reportFd, []byte(report)); err != nil {
+	if err := writeReport(reportFd, cmd.Process.Pid, "ok"); err != nil {
 		// runc now has no pid for this process, so nothing will ever signal,
 		// count or reap it. Take it down rather than leak a container process
 		// that no one can account for.

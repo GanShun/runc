@@ -693,9 +693,19 @@ func (p *setnsProcess) adoptRuncNsChild() (retErr error) {
 	p.closePidReportChild()
 	defer p.pidReport.Close()
 
+	// The stage is runc's child, so on every failure below it would stay a zombie
+	// for anyone whose process outlives the call -- runc exits, a libcontainer
+	// embedder need not. Waiting twice is an error this ignores; the readErr
+	// branch waits first because it needs the status.
+	defer func() {
+		if retErr != nil {
+			_, _ = p.cmd.Process.Wait()
+		}
+	}()
+
 	report, readErr := bufio.NewReader(p.pidReport).ReadString('\n')
-	pid, parseErr := strconv.Atoi(strings.TrimSpace(report))
-	if parseErr == nil && pid <= 0 {
+	pid, stageErr, parseErr := parseRuncNsReport(report)
+	if parseErr == nil && stageErr == nil && pid <= 0 {
 		// A zero pid kills the caller's process group and a negative one
 		// every process the caller may signal, so a "pid" that is not positive
 		// is a malformed report, not a pid.
@@ -728,9 +738,8 @@ func (p *setnsProcess) adoptRuncNsChild() (retErr error) {
 	}
 
 	if readErr != nil {
-		// The stage failed before it reported anything. Its exit status is
-		// the diagnosis -- it prints the reason to stderr, which is the
-		// container's, and exits non-zero.
+		// The stage died without reporting. Its own exit status is all there
+		// is; the reason, when it had one, is on the report it never finished.
 		if status, werr := p.cmd.Process.Wait(); werr == nil && status != nil && !status.Success() {
 			return &exec.ExitError{ProcessState: status}
 		}
@@ -738,6 +747,28 @@ func (p *setnsProcess) adoptRuncNsChild() (retErr error) {
 	}
 	if parseErr != nil {
 		return fmt.Errorf("error parsing pid %q reported by %s: %w", report, RuncNsCommand, parseErr)
+	}
+	if stageErr != nil {
+		if pid > 0 {
+			// The stage created the process but could not hand it over. Kill it and
+			// reap it here, in that order: a deferred reap runs last-in-first-out,
+			// so it would run *before* the kill defer above and a WNOHANG wait on a
+			// live process reaps nothing -- which is what an earlier version of this
+			// did while claiming otherwise.
+			//
+			// No stage writes this report today: reportFailure always reports pid 0.
+			// It is a guard on the protocol rather than a path in use, and the test
+			// feeds the report directly.
+			_ = killProcess(pid)
+			var ws unix.WaitStatus
+			_, _ = unix.Wait4(pid, &ws, 0, nil)
+			pid = 0
+			// The pid is reaped and therefore free, and the deferred kill above
+			// fires on this error return. Zeroing it makes the deferred kill a
+			// no-op -- killProcess refuses a pid that is not positive -- instead of
+			// a signal to whatever the kernel has since handed that number to.
+		}
+		return fmt.Errorf("%s stage: %w", RuncNsCommand, stageErr)
 	}
 
 	// Reap the stage before replacing the Process, so nothing is left behind
@@ -758,15 +789,45 @@ func (p *setnsProcess) adoptRuncNsChild() (retErr error) {
 // killProcess sends SIGKILL to pid, best-effort. It exists for the failure
 // paths in adoptRuncNsChild, where a process the stage created has to be taken
 // down because nothing adopted it.
+// killProcessSeen, when set by a test, records the pids killProcess is asked to
+// signal. A guard that can aim at a reaped pid is not a guard, and counting the
+// calls is the only way to see it.
+var killProcessSeen func(pid int)
+
 func killProcess(pid int) error {
 	if pid <= 0 {
 		return fmt.Errorf("refusing to kill pid %d", pid)
+	}
+	if killProcessSeen != nil {
+		killProcessSeen(pid)
 	}
 	process, err := os.FindProcess(pid)
 	if err != nil {
 		return err
 	}
 	return process.Kill()
+}
+
+// parseRuncNsReport reads what the stage writes: "<pid> <status>", where status is
+// "ok" or "err: <reason>". A stage that fails before creating a process reports a
+// pid of 0, so the caller knows there is nothing to kill.
+func parseRuncNsReport(report string) (pid int, stageErr error, err error) {
+	fields := strings.SplitN(strings.TrimSpace(report), " ", 2)
+	pid, err = strconv.Atoi(fields[0])
+	if err != nil {
+		return 0, nil, err
+	}
+	if len(fields) < 2 {
+		return 0, nil, fmt.Errorf("report %q has no status", strings.TrimSpace(report))
+	}
+	status := fields[1]
+	if status == "ok" {
+		return pid, nil, nil
+	}
+	if reason, ok := strings.CutPrefix(status, "err: "); ok {
+		return pid, errors.New(reason), nil
+	}
+	return 0, nil, fmt.Errorf("report %q has an unknown status", strings.TrimSpace(report))
 }
 
 // firstFieldPid recovers a pid from a report that is not exactly "<pid>\n". It

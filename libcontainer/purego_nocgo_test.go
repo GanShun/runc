@@ -4,6 +4,7 @@ package libcontainer
 
 import (
 	"bufio"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -12,6 +13,8 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+
+	"golang.org/x/sys/unix"
 	"time"
 )
 
@@ -209,9 +212,9 @@ func TestStartExecNsStageStartsCallerParentedChild(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read reported pid: %v", err)
 	}
-	pid, err := strconv.Atoi(strings.TrimSpace(report))
-	if err != nil || pid <= 0 {
-		t.Fatalf("reported pid %q is not a pid: %v", report, err)
+	pid, stageErr, err := parseRuncNsReport(report)
+	if err != nil || stageErr != nil || pid <= 0 {
+		t.Fatalf("report %q is not a successful report: pid %d, stage error %v, %v", report, pid, stageErr, err)
 	}
 	defer func() { _ = killProcess(pid) }()
 
@@ -276,7 +279,7 @@ func TestAdoptRuncNsChildAdoptsReportedPid(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := fmt.Fprintf(reportChild, "%d\n", target.Process.Pid); err != nil {
+	if _, err := fmt.Fprintf(reportChild, "%d ok\n", target.Process.Pid); err != nil {
 		t.Fatal(err)
 	}
 	_ = reportChild.Close()
@@ -364,4 +367,180 @@ func TestAdoptRuncNsChildKillsUnadoptedProcess(t *testing.T) {
 		t.Fatal("expected a malformed report to fail adoption")
 	}
 	assertProcessDies(t, target)
+}
+
+// TestParseRuncNsReport pins the protocol between the stage and the runc that
+// started it. Both halves are in this package, so a change that only updates one
+// of them has to fail here.
+func TestParseRuncNsReport(t *testing.T) {
+	const tid = 4242
+	for _, tc := range []struct {
+		name      string
+		report    string
+		wantPid   int
+		wantStage string
+		wantErr   bool
+	}{
+		{
+			name:    "a staged process",
+			report:  "4242 ok\n",
+			wantPid: tid,
+		},
+		{
+			// The stage failed before creating anything, so there is no process
+			// for runc to kill -- and the reason is still delivered, which is the
+			// whole point: stderr is the container's.
+			name:      "a stage that never created a process",
+			report:    "0 err: open /proc/1/ns/pid: permission denied\n",
+			wantStage: "open /proc/1/ns/pid: permission denied",
+		},
+		{
+			// Created but not handed over: runc has to reap it, and the reason
+			// has to survive.
+			name:      "a process that could not be handed over",
+			report:    "4242 err: write: broken pipe\n",
+			wantPid:   tid,
+			wantStage: "write: broken pipe",
+		},
+		{
+			name:    "a report with no status",
+			report:  "4242\n",
+			wantErr: true,
+		},
+		{
+			name:    "an unknown status",
+			report:  "4242 maybe\n",
+			wantErr: true,
+		},
+		{
+			name:    "a report that is not a report",
+			report:  "garbage\n",
+			wantErr: true,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			pid, stageErr, err := parseRuncNsReport(tc.report)
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("report %q parsed as pid %d, stage error %v; want an error", tc.report, pid, stageErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("parseRuncNsReport(%q): %v", tc.report, err)
+			}
+			if pid != tc.wantPid {
+				t.Errorf("pid = %d, want %d", pid, tc.wantPid)
+			}
+			switch {
+			case tc.wantStage == "" && stageErr != nil:
+				t.Errorf("stage error = %v, want none", stageErr)
+			case tc.wantStage != "" && stageErr == nil:
+				t.Errorf("stage error = nil, want %q", tc.wantStage)
+			case tc.wantStage != "" && stageErr.Error() != tc.wantStage:
+				t.Errorf("stage error = %q, want %q", stageErr, tc.wantStage)
+			}
+		})
+	}
+}
+
+// TestReportFailureUsesTheReportDescriptor is the other half of #3: a failed stage
+// must tell runc why, and must not tell the container. The stage's stderr is the
+// exec'd process's stderr, so a reason printed there reaches the container's log
+// and leaves runc with a bare exit status.
+func TestReportFailureUsesTheReportDescriptor(t *testing.T) {
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Close()
+	defer w.Close()
+	t.Setenv(runcNsReportFdEnv, strconv.Itoa(int(w.Fd())))
+
+	reportFailure(errors.New("setns(CLONE_NEWPID, /proc/1/ns/pid): permission denied"))
+
+	_ = w.Close()
+	report, err := bufio.NewReader(r).ReadString('\n')
+	if err != nil {
+		t.Fatalf("read report: %v", err)
+	}
+	pid, stageErr, err := parseRuncNsReport(report)
+	if err != nil {
+		t.Fatalf("the report the stage wrote is not one runc can read: %q: %v", report, err)
+	}
+	if pid != 0 {
+		t.Errorf("pid = %d, want 0: no process was created, so runc must not aim at one", pid)
+	}
+	if stageErr == nil || !strings.Contains(stageErr.Error(), "permission denied") {
+		t.Errorf("stage error = %v, want the reason to survive the round trip", stageErr)
+	}
+}
+
+// TestAdoptRuncNsChildReapsAFailedHandover covers the "<pid> err:" report, which
+// no stage writes today: reportFailure always reports pid 0. The branch is a guard
+// on the protocol, so it is fed directly -- and it has to kill *and* reap, in that
+// order. A deferred reap runs last-in-first-out and therefore before the kill, so
+// a WNOHANG wait reaps nothing and the zombie the branch exists to prevent
+// survives.
+func TestAdoptRuncNsChildReapsAFailedHandover(t *testing.T) {
+	helper := startPuregoHelper(t, "exit")
+	defer func() {
+		_ = helper.Process.Kill()
+		_, _ = helper.Process.Wait()
+	}()
+
+	target := startPuregoHelper(t, "block")
+	targetPid := target.Process.Pid
+
+	reportParent, reportChild, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fmt.Fprintf(reportChild, "%d err: could not hand over\n", targetPid); err != nil {
+		t.Fatal(err)
+	}
+	_ = reportChild.Close()
+
+	var seen []int
+	killProcessSeen = func(pid int) { seen = append(seen, pid) }
+	defer func() { killProcessSeen = nil }()
+
+	p := &setnsProcess{
+		containerProcess: containerProcess{cmd: helper, process: &Process{}},
+		pidReport:        reportParent,
+	}
+	if err := p.adoptRuncNsChild(); err == nil {
+		t.Fatal("expected a failed handover to fail adoption")
+	} else if !strings.Contains(err.Error(), "could not hand over") {
+		t.Errorf("error = %v, want the stage's reason to survive", err)
+	}
+
+	// A signal to a reaped pid reaches whatever the kernel has since handed that
+	// number to, so the branch has to disarm the deferred kill after waiting.
+	if len(seen) != 1 || seen[0] != targetPid {
+		t.Errorf("killProcess saw %v, want only the failed handover's %d", seen, targetPid)
+	}
+
+	// Killed and reaped, checked without waiting for it ourselves: kill(pid, 0)
+	// on a zombie succeeds, so ESRCH is only returned once the kernel has released
+	// the process. Using assertProcessDies here would hide the very thing this
+	// test is for, because it reaps the zombie itself.
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		err := unix.Kill(targetPid, 0)
+		if err == unix.ESRCH {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("pid %d still exists (%v) after a failed handover: killed but not reaped", targetPid, err)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	// And it must not be waiting for someone else to reap it either: ECHILD says
+	// the kernel already has no child with that pid for us.
+	var ws unix.WaitStatus
+	if got, err := unix.Wait4(targetPid, &ws, unix.WNOHANG, nil); err != unix.ECHILD {
+		t.Errorf("Wait4(%d) = %d, %v; want ECHILD: the process was left for someone else to reap", targetPid, got, err)
+	}
 }
