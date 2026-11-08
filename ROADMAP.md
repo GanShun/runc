@@ -235,12 +235,12 @@ test. The alternative — a separate `runc-ns` helper — is what `libcontainer:
 stage runc exec into the container PID namespace without cgo` shipped and
 `libcontainer: make the exec PID-namespace stage a runc subcommand` replaced.
 
-**Observed running, two ways.** PR #3's description records the end-to-end check —
+**Observed running, two ways.** The merge request that landed it records the end-to-end check —
 the exec'd process's `/proc/self/ns/pid` matches the container init's, and a real
 CNI agent whose `postStart`/`preStop` hooks had been failing now starts with them
 intact. And upstream's own `TestExecIn` now passes against this build, with a real
 `setns(2)`, in a k4s node, because it is the only environment that has the root
-this suite needs (issue #4):
+this suite needs (the shared CI runner has none; an open issue on the fork):
 
 ```
 make test-runc K4S_RUNC_TESTS='TestExecIn$'      # k4s, in the guest
@@ -451,7 +451,7 @@ command or assertion that would close it.
    mounts, cgroups and containers. `.gitlab-ci.yml` carries a
    `libcontainer-integration` job for it, `manual` and `allow_failure`, and it
    **probes first**: `unshare --mount --pid --fork` and a writable
-   `cgroup.controllers`. Measured on the shared runner (pipeline 588, job 1586):
+   `cgroup.controllers`. Measured on the shared GitLab runner (pipeline 588, job 1586):
    the probe fails in 0.4 s because the runner's pod has no `CAP_SYS_ADMIN`. So
    the job is a tripwire that becomes a gate the day a privileged runner exists,
    not a check that passes.
@@ -531,7 +531,7 @@ rather than on the container.
 
 **Observed running.** `TestInitJoinPID` and `TestSharedPidnsInitKill` pass against
 this build, with real containers and a real `setns(2)`, in a k4s node — the only
-environment that has the root this suite needs (issue #4):
+environment that has the root this suite needs (the shared CI runner has none):
 
 ```
 make test-runc K4S_RUNC_TESTS='TestInitJoinPID|TestSharedPidnsInitKill'
